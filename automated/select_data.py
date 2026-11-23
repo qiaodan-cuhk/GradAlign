@@ -1,247 +1,192 @@
 #!/usr/bin/env python3
-
-import os
-import json
+"""Selection strategies and their shared command-line entry point."""
 import argparse
+import json
+import math
 import random
-from itertools import islice
-from typing import List, Set, Dict, Tuple
+from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
 
-import datasets as hfds  # type: ignore[import-not-found]
+import datasets as hfds
 
 from config import get_dataset_dir, get_response_dir
 
 
-def _read_topn_group_ids(sim_jsonl_path: str, top_n: int, neg: bool = False) -> List[int]:
-    pairs: List[Tuple[int, float]] = []
-    with open(sim_jsonl_path, "r", encoding="utf-8") as f:
+@dataclass
+class SelectionInputs:
+    ids: list[int]
+    accuracy: dict[int, float]
+    similarity: dict[int, float]
+    n: int
+    rng: random.Random
+    acc_low: float
+    acc_high: float
+    limit: int | None
+    parts_root: Path | None
+
+
+@dataclass(frozen=True)
+class Selector:
+    choose: Callable[[SelectionInputs], list[int]]
+    use_accuracy: bool = False
+    gradient: str | None = None
+    reference_rollouts: bool = False
+    raw_rollouts: bool = False
+
+    @property
+    def candidate_rollouts(self):
+        return self.raw_rollouts or self.use_accuracy or self.gradient is not None
+
+
+def by_similarity(data):
+    return sorted(data.similarity, key=data.similarity.get, reverse=True)[:data.n]
+
+
+def by_negative_similarity(data):
+    return sorted(data.similarity, key=data.similarity.get)[:data.n]
+
+
+def by_accuracy_band(data):
+    pool = [gid for gid, acc in data.accuracy.items()
+            if data.acc_low <= acc <= data.acc_high and (data.limit is None or gid < data.limit)]
+    return data.rng.sample(pool, min(data.n, len(pool)))
+
+
+def by_accgreedy(data):
+    return sorted(data.accuracy, key=lambda gid: abs(data.accuracy[gid] - 0.5))[:data.n]
+
+
+def by_similarity_and_accuracy(data):
+    scores = {gid: sim * 4 * data.accuracy[gid] * (1 - data.accuracy[gid])
+              for gid, sim in data.similarity.items() if gid in data.accuracy}
+    return sorted(scores, key=scores.get, reverse=True)[:data.n]
+
+
+def random_in_chunk(data):
+    pool = data.ids[:data.limit]
+    return data.rng.sample(pool, min(data.n, len(pool)))
+
+
+SELECTOR_REGISTRY = {
+    "sim": Selector(by_similarity, gradient="sim", reference_rollouts=True),
+    "dot": Selector(by_similarity, gradient="dot", reference_rollouts=True),
+    "norm": Selector(by_similarity, gradient="norm"),
+    "align": Selector(by_similarity, gradient="sim"),
+    "negsim": Selector(by_negative_similarity, gradient="sim", reference_rollouts=True),
+    "simacc": Selector(by_similarity_and_accuracy, use_accuracy=True, gradient="sim", reference_rollouts=True),
+    "acc": Selector(by_accuracy_band, use_accuracy=True),
+    "accgreedy": Selector(by_accgreedy, use_accuracy=True),
+    "rand_in_chunk": Selector(random_in_chunk),
+}
+SELECTOR_REGISTRY["rand"] = SELECTOR_REGISTRY["rand_in_chunk"]
+
+
+def _scores(path, key, pool):
+    scores = {}
+    with path.open(encoding="utf-8") as f:
         for line in f:
-            s = line.strip()
-            if not s:
+            if not line.strip():
                 continue
-            try:
-                obj = json.loads(s)
-            except json.JSONDecodeError:
-                continue
-            if "group_id" in obj and "similarity" in obj:
-                try:
-                    gid = int(obj["group_id"])
-                    sim = float(obj["similarity"])
-                except (TypeError, ValueError):
-                    continue
-                pairs.append((gid, sim))
-    pairs.sort(key=lambda x: x[1], reverse=not neg)
-    # print('n', top_n)
-    print([x[1] for x in pairs[top_n-10:top_n]])
-    return [gid for gid, _ in pairs[:top_n]]
+            row = json.loads(line)
+            gid = int(row["group_id"])
+            if gid in pool:
+                value = float(row[key])
+                if not math.isfinite(value) or gid in scores:
+                    raise ValueError(f"Invalid or duplicate {key} for group {gid} in {path}")
+                scores[gid] = value
+    return scores
 
 
-def _read_similarity_map(sim_jsonl_path: str) -> Dict[int, float]:
-    sim_map: Dict[int, float] = {}
-    with open(sim_jsonl_path, "r", encoding="utf-8") as f:
-        for line in f:
-            s = line.strip()
-            if not s:
-                continue
-            try:
-                obj = json.loads(s)
-            except json.JSONDecodeError:
-                continue
-            if "group_id" in obj and "similarity" in obj:
-                try:
-                    gid = int(obj["group_id"])
-                    sim = float(obj["similarity"])
-                except (TypeError, ValueError):
-                    continue
-                sim_map[gid] = sim
-    return sim_map
+def select_from_chunk(mode, dataset_dir, parts_root, n, output_dir, *,
+                      similarity_filename="similarity_results_aggregated.jsonl",
+                      acc_low=0.2, acc_high=0.8, limit=None, rng=None):
+    strategy = SELECTOR_REGISTRY[mode]
+    source = Path(dataset_dir) / "train.jsonl"
+    with source.open(encoding="utf-8") as f:
+        ids = [row["extra_info"]["index"] for row in map(json.loads, f)]
+    pool = set(ids)
+    if len(pool) != len(ids):
+        raise ValueError(f"Duplicate candidate IDs in {source}")
+    if n <= 0:
+        raise ValueError("Selection size must be positive")
+    parts = Path(parts_root) if parts_root is not None else None
+    if strategy.candidate_rollouts and parts is None:
+        raise ValueError(f"{mode} needs candidate rollout artifacts")
+    data = SelectionInputs(
+        ids, _scores(parts / "accuracy_by_problem.jsonl", "accuracy", pool) if strategy.use_accuracy else {},
+        _scores(parts / similarity_filename, "similarity", pool) if strategy.gradient else {},
+        n, rng if rng is not None else random.Random(), acc_low, acc_high, limit, parts,
+    )
+    chosen = strategy.choose(data)
+    selected = set(chosen)
+    if not selected or len(selected) != len(chosen) or not selected <= pool or len(selected) > n:
+        raise ValueError(f"{mode} returned invalid candidate IDs from {source}")
+    if len(selected) < n:
+        print(f"Selected all {len(selected)} eligible problems (requested {n})")
+
+    with source.open(encoding="utf-8") as f:
+        rows = [row for row in map(json.loads, f) if row["extra_info"]["index"] in selected]
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    with (out / "train.jsonl").open("w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    hfds.Dataset.from_list(rows).to_parquet(str(out / "train.parquet"))
+    return selected
 
 
-def _read_acc_map(acc_jsonl_path: str) -> Dict[int, float]:
-    acc: Dict[int, float] = {}
-    with open(acc_jsonl_path, "r", encoding="utf-8") as f:
-        for line in f:
-            s = line.strip()
-            if not s:
-                continue
-            try:
-                obj = json.loads(s)
-            except json.JSONDecodeError:
-                continue
-            if "group_id" in obj and "accuracy" in obj:
-                try:
-                    gid = int(obj["group_id"])
-                    a = float(obj["accuracy"])
-                except (TypeError, ValueError):
-                    continue
-                acc[gid] = a
-    return acc
+# Keep existing standalone Python callers on the same selection implementation.
+def select_random(dataset_dir, n, output_dir, max_num=None, rng=random):
+    return select_from_chunk("rand", dataset_dir, None, n, output_dir, limit=max_num, rng=rng)
 
 
-def _write_selected(dataset_train_path: str, selected_ids: Set[int], out_dir: str) -> Tuple[str, str]:
-    os.makedirs(out_dir, exist_ok=True)
-    out_jsonl = os.path.join(out_dir, "train.jsonl")
-    selected: List[Dict] = []
-    with open(dataset_train_path, "r", encoding="utf-8") as f_in, open(out_jsonl, "w", encoding="utf-8") as f_out:
-        for line in f_in:
-            obj = json.loads(line)
-            idx = obj['extra_info']['index']
-            if idx in selected_ids:
-                selected.append(obj)
-                f_out.write(json.dumps(obj, ensure_ascii=False) + "\n")
-    out_parquet = out_jsonl.replace(".jsonl", ".parquet")
-    if selected:
-        hfds.Dataset.from_list(selected).to_parquet(out_parquet)
-    return out_jsonl, out_parquet
+def select_by_similarity(dataset_dir, parts_root, top_n, output_dir, filename, neg=False):
+    return select_from_chunk("negsim" if neg else "sim", dataset_dir, parts_root, top_n, output_dir,
+                             similarity_filename=filename)
 
 
-def select_by_similarity(dataset_dir: str, parts_root: str, top_n: int, output_dir: str, filename: str, neg: bool = False) -> None:
-    sim_path = os.path.join(parts_root, filename)
-    assert os.path.isfile(sim_path), f"Similarity file not found: {sim_path}"
-    gids = _read_topn_group_ids(sim_path, top_n, neg)
-    selected_ids = set(gids)
-    dataset_train = os.path.join(dataset_dir, "train.jsonl")
-    print('Selected', len(selected_ids))
-    _write_selected(dataset_train, selected_ids, output_dir)
+def select_by_accuracy(dataset_dir, parts_root, n, acc_low, acc_high, output_dir, lim=None, rng=random):
+    return select_from_chunk("acc", dataset_dir, parts_root, n, output_dir, acc_low=acc_low, acc_high=acc_high,
+                             limit=lim, rng=rng)
 
 
-def select_by_accuracy(dataset_dir: str, parts_root: str, n: int, acc_low: float, acc_high: float, output_dir: str, lim: int | None = None, rng=random) -> None:
-    acc_path = os.path.join(parts_root, "accuracy_by_problem.jsonl")
-    assert os.path.isfile(acc_path), f"Accuracy file not found: {acc_path}"
-    acc_map = _read_acc_map(acc_path)
-    # print(acc_map)
-    pool = [gid for gid, a in acc_map.items() if acc_low <= a <= acc_high and (lim is None or gid < int(lim))]
-    if not pool:
-        raise SystemExit("No group_ids satisfy the accuracy constraints")
-    if n > len(pool):
-        print(f"Warning: requested {n} but only {len(pool)} available; selecting all.")
-        n = len(pool)
-    selected_ids = set(rng.sample(pool, n))
-    dataset_train = os.path.join(dataset_dir, "train.jsonl")
-    print('Selected', len(selected_ids))
-    _write_selected(dataset_train, selected_ids, output_dir)
+def select_by_simacc(dataset_dir, parts_root, n, output_dir, filename):
+    return select_from_chunk("simacc", dataset_dir, parts_root, n, output_dir, similarity_filename=filename)
 
 
-def select_by_simacc(dataset_dir: str, parts_root: str, n: int, output_dir: str, filename: str) -> None:
-    sim_path = os.path.join(parts_root, filename)
-    acc_path = os.path.join(parts_root, "accuracy_by_problem.jsonl")
-    assert os.path.isfile(sim_path), f"Similarity file not found: {sim_path}"
-    assert os.path.isfile(acc_path), f"Accuracy file not found: {acc_path}"
-    sim_map = _read_similarity_map(sim_path)
-    acc_map = _read_acc_map(acc_path)
-    pairs: List[Tuple[int, float, float, float]] = []
-    for gid, sim in sim_map.items():
-        if gid not in acc_map:
-            continue
-        a = acc_map[gid]
-        score = sim * (a * (1.0 - a)) * 4
-        pairs.append((gid, score, sim, a))
-    if not pairs:
-        raise SystemExit("No overlapping group_ids between similarity and accuracy inputs")
-    pairs.sort(key=lambda x: x[1], reverse=True)
-    if n > len(pairs):
-        print(f"Warning: requested {n} but only {len(pairs)} available; selecting all.")
-        n = len(pairs)
-    print(pairs[n-10:n])
-    selected_ids = set(gid for gid, _, _, _ in pairs[:n])
-    dataset_train = os.path.join(dataset_dir, "train.jsonl")
-    print('Selected', len(selected_ids))
-    _write_selected(dataset_train, selected_ids, output_dir)
-
-
-def select_by_accgreedy(dataset_dir: str, parts_root: str, n: int, output_dir: str) -> None:
-    acc_path = os.path.join(parts_root, "accuracy_by_problem.jsonl")
-    assert os.path.isfile(acc_path), f"Accuracy file not found: {acc_path}"
-    acc_map = _read_acc_map(acc_path)
-    if not acc_map:
-        raise SystemExit("No accuracy records found for accgreedy selection")
-    # Sort by closeness to 0.5
-    ordered = sorted(acc_map.items(), key=lambda kv: abs(kv[1] - 0.5))
-    if n > len(ordered):
-        print(f"Warning: requested {n} but only {len(ordered)} available; selecting all.")
-        n = len(ordered)
-    selected_ids = set(gid for gid, _ in ordered[:n])
-    dataset_train = os.path.join(dataset_dir, "train.jsonl")
-    print('Selected', len(selected_ids))
-    _write_selected(dataset_train, selected_ids, output_dir)
-
-
-def select_random(dataset_dir: str, n: int, output_dir: str, max_num: int | None = None, rng=random) -> None:
-    with open(os.path.join(dataset_dir, "train.jsonl"), encoding="utf-8") as source:
-        ids = [json.loads(line)["extra_info"]["index"] for line in islice(source, max_num)]
-    if len(set(ids)) != len(ids):
-        raise ValueError("Candidate problem IDs must be unique")
-    selected_indices = set(rng.sample(ids, min(n, len(ids))))
-    print('Selected', len(selected_indices))
-    _write_selected(os.path.join(dataset_dir, "train.jsonl"), selected_indices, output_dir)
+def select_by_accgreedy(dataset_dir, parts_root, n, output_dir):
+    return select_from_chunk("accgreedy", dataset_dir, parts_root, n, output_dir)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Unified data selector by similarity/accuracy/random")
-    parser.add_argument("--mode", required=True, choices=["sim", "acc", "rand", 'simacc', 'accgreedy', 'align', 'negsim'], help="Selection mode")
-    parser.add_argument("--dataset", required=True, type=str, help="Dataset key")
-    parser.add_argument("--model", required=True, type=str, help="Tokenizer/model key used for dataset preparation")
-    parser.add_argument("--n", type=int, default=10000, help="Number of items to select (used in all modes, replaces --top_n)")
+    parser = argparse.ArgumentParser(description="Select training problems from a candidate chunk")
+    parser.add_argument("--mode", required=True, choices=SELECTOR_REGISTRY)
+    parser.add_argument("--dataset", required=True)
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--candidate_dir", help="Directory containing the current train.jsonl")
+    parser.add_argument("--n", type=int, default=10000)
     parser.add_argument("--acc_low", type=float, default=0.2)
     parser.add_argument("--acc_high", type=float, default=0.8)
-    parser.add_argument("--lim", type=int, default=None, help="Optional limit on candidates (group_id upper bound in acc; max lines in rand)")
-    parser.add_argument("--similarity_filename", type=str, default="similarity_results_aggregated.jsonl")
-    parser.add_argument("--output_dir", type=str, default=None, help="Optional explicit output directory")
-    parser.add_argument("--parts_root", type=str, default=None, help="Override responses split root (compat with dynamic selection)")
-
-    parser.add_argument("--candidate_dir", help="Current candidate chunk containing train.jsonl")
+    parser.add_argument("--lim", type=int)
     parser.add_argument("--seed", type=int, help="Round-specific selection seed")
+    parser.add_argument("--similarity_filename", default="similarity_results_aggregated.jsonl")
+    parser.add_argument("--output_dir")
+    parser.add_argument("--parts_root")
     args = parser.parse_args()
 
-    dataset_dir = args.candidate_dir or get_dataset_dir(args.dataset, args.model)
-    if args.output_dir is None:
-        # Place selections under dataset_dir/selected/<mode-specific>
-        selected_root = os.path.join(dataset_dir, "selected", args.model)
-        if args.mode == "sim":
-            subdir = f"sim_{args.n}"
-        elif args.mode == "align":
-            subdir = f"align_{args.n}"
-        elif args.mode == "negsim":
-            subdir = f"negsim_{args.n}"
-        elif args.mode == "simacc":
-            subdir = f"simacc_{args.n}"
-        elif args.mode == "acc":
-            subdir = f"acc_{args.acc_low}_{args.acc_high}_{args.n}"
-        elif args.mode == "accgreedy":
-            subdir = f"accgreedy_{args.n}"
-        else:
-            subdir = f"random_{args.n}"
-        output_dir = os.path.join(selected_root, subdir)
-    else:
-        output_dir = args.output_dir
-
-    parts_root = None
-    if args.mode in {"sim", "acc", "simacc", "accgreedy", "align", "negsim"}:
-        if not args.model:
-            raise SystemExit("--model is required for sim/acc modes to locate responses")
-        parts_root = args.parts_root or (get_response_dir(args.dataset, args.model) + "_split")
-        if not os.path.isdir(parts_root):
-            raise SystemExit(f"Parts root not found: {parts_root}")
-
-    if args.mode == "sim" or args.mode == "align" or args.mode == "negsim":
-        assert parts_root is not None
-        select_by_similarity(dataset_dir, parts_root, int(args.n), output_dir, args.similarity_filename, neg=args.mode == "negsim")
-    elif args.mode == "simacc":
-        assert parts_root is not None
-        select_by_simacc(dataset_dir, parts_root, int(args.n), output_dir, args.similarity_filename)
-    elif args.mode == "acc":
-        assert parts_root is not None
-        select_by_accuracy(dataset_dir, parts_root, int(args.n), float(args.acc_low), float(args.acc_high), output_dir, lim=args.lim, rng=random.Random(args.seed))
-    elif args.mode == "accgreedy":
-        assert parts_root is not None
-        select_by_accgreedy(dataset_dir, parts_root, int(args.n), output_dir)
-    else:
-        select_random(dataset_dir, int(args.n), output_dir, max_num=args.lim, rng=random.Random(args.seed))
-
-    print(f"Selection complete. Output: {output_dir}")
+    directory = args.candidate_dir or get_dataset_dir(args.dataset, args.model)
+    parts = args.parts_root
+    if parts is None and SELECTOR_REGISTRY[args.mode].candidate_rollouts:
+        parts = get_response_dir(args.dataset, args.model) + "_split"
+    name = "random" if args.mode in ("rand", "rand_in_chunk") else args.mode
+    if name == "acc":
+        name += f"_{args.acc_low}_{args.acc_high}"
+    out = args.output_dir or Path(directory) / "selected" / args.model / f"{name}_{args.n}"
+    select_from_chunk(args.mode, directory, parts, args.n, out, similarity_filename=args.similarity_filename,
+                      acc_low=args.acc_low, acc_high=args.acc_high, limit=args.lim, rng=random.Random(args.seed))
+    print(f"Selection complete. Output: {out}")
 
 
 if __name__ == "__main__":
     main()
-
-

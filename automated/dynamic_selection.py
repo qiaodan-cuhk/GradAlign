@@ -9,7 +9,8 @@ from typing import List, Tuple
 
 import datasets as hfds  # type: ignore[import-not-found]
 
-from config import get_dataset_dir, get_response_dir
+from config import get_dataset_dir
+from select_data import SELECTOR_REGISTRY
 from launch_verl_training import DEFAULT_CHECKPOINT_ROOT, DEFAULT_ROLLOUT_N, build_exp_name
 
 
@@ -141,7 +142,7 @@ def main():
     parser.add_argument("--seed", default=42, type=int)
 
     # Selection controls
-    parser.add_argument("--mode", choices=["sim", "simacc", "acc", "rand", "accgreedy", 'align', 'negsim', 'norm', 'dot'], required=True)
+    parser.add_argument("--mode", choices=SELECTOR_REGISTRY, required=True)
     parser.add_argument("--acc_low", type=float, default=0.2)
     parser.add_argument("--acc_high", type=float, default=0.8)
     parser.add_argument("--epochs_per_select", type=int, default=1,
@@ -181,6 +182,7 @@ def main():
     parser.add_argument("--verl_val_set", type=str, default="amc_mc_aime_amc_mmlupro")
 
     args = parser.parse_args()
+    strategy = SELECTOR_REGISTRY[args.mode]
     if args.rollout_n < 1:
         parser.error("--rollout_n must be positive")
     args.ckpt_root = os.path.abspath(os.path.expanduser(args.ckpt_root))
@@ -257,7 +259,7 @@ def main():
 
         # 2) If i>0: merge previous iteration checkpoint and override model path
         merged_model_path = None
-        if i > 0 and args.mode != "rand":
+        if i > 0 and strategy.candidate_rollouts:
             # Expect VERL to have produced checkpoints under ckpt_root/{prefix}_sel{iter-1}_{model}_{train_dataset}_{train_name}_{val_name}/global_step_{i}
             # We'll merge that step to dest_root and use it for inference/analysis
             train_name = os.path.basename(os.path.normpath(train_dir))
@@ -339,16 +341,14 @@ def main():
                         actual_train = len(data)
             except json.JSONDecodeError:
                 actual_train = 0
-        if args.mode == "rand":
-            pass  # Uniform sampling only consumes candidate IDs.
-        elif actual_train >= expected_train and expected_train > 0:
+        if actual_train >= expected_train and expected_train > 0:
             print(f"Skip train inference for step {i}: found {actual_train}/{expected_train} responses")
-        else:
+        elif strategy.candidate_rollouts:
             print("Executing:", " ".join(infer_cmd))
             subprocess.run(infer_cmd, check=True)
 
         # 3b) Local validation inference → responses.json in step-root val_responses (flat)
-        if args.mode in ['sim', 'simacc', 'negsim', 'dot']:
+        if strategy.reference_rollouts:
             val_prompts_file = os.path.join(val_dir, "train.jsonl")
             if not os.path.isfile(val_prompts_file):
                 raise SystemExit(f"Validation prompts not found: {val_prompts_file}")
@@ -402,9 +402,8 @@ def main():
                 subprocess.run(infer_val_cmd, check=True)
 
         # 3) Analysis and aggregation (for sim/simacc)
-        if args.mode in {"sim", "simacc", "align", "negsim", 'norm', 'dot'}:
-            if args.mode == 'align' or args.mode == 'norm':
-                args.val_dataset = args.train_dataset
+        if strategy.gradient:
+            if not strategy.reference_rollouts:
                 val_dir_override = train_resp_dir
             ana_cmd = [
                 sys.executable, os.path.join(os.path.dirname(__file__), "run_parallel_analysis.py"),
@@ -413,7 +412,7 @@ def main():
                 "--model", args.model,
                 "--resp_dataset", args.train_dataset,
                 "--problem_dataset", args.train_dataset,
-                "--val_dataset", args.val_dataset,
+                "--val_dataset", args.val_dataset if strategy.reference_rollouts else args.train_dataset,
                 "--parts_root", train_parts_root,
                 "--val_responses_dir", val_dir_override,
                 "--num_gpus", "8",
@@ -423,9 +422,9 @@ def main():
             ]
             if merged_model_path:
                 ana_cmd.extend(["--model_path", merged_model_path])
-            if args.mode == 'norm' or args.mode == 'dot':
-                # Pass mode as separate CLI argument and value
-                ana_cmd.extend(["--mode", args.mode])
+            ana_cmd.extend(["--mode", strategy.gradient])
+            if args.use_optimizer and merged_model_path:
+                ana_cmd.extend(["--use_optimizer", "--optimizer_state_path", optimizer_state_path])
             # Skip analysis if per-response similarity already computed
             sim_path = os.path.join(train_part_dir, "similarity_results_cosine_real.jsonl")
             sim_lines = _count_lines(sim_path) if os.path.isfile(sim_path) else 0
@@ -437,7 +436,7 @@ def main():
 
 
         # Aggregate accuracy and copy similarity
-        if args.mode in {"sim", "simacc", "acc", "accgreedy", 'align', 'negsim', 'norm', 'dot'}:
+        if strategy.gradient or strategy.use_accuracy:
             agg_cmd = [
                 sys.executable, os.path.join(os.path.dirname(__file__), "aggregate.py"),
                 "--model_name", args.model,
@@ -450,12 +449,9 @@ def main():
         # 4) Select top-N according to mode
         iter_out = os.path.join(exp_ckpt_root, "selected", f"iter_{i}_{args.mode}_{select_n}")
         os.makedirs(iter_out, exist_ok=True)
-        select_mode = args.mode
-        if select_mode == 'dot' or select_mode == 'norm':
-            select_mode = 'sim'
         sel_cmd = [
             sys.executable, os.path.join(os.path.dirname(__file__), "select_data.py"),
-            "--mode", select_mode,
+            "--mode", args.mode,
             "--dataset", args.train_dataset,
             "--model", args.model,
             "--n", str(select_n),
@@ -463,10 +459,9 @@ def main():
             "--candidate_dir", chunk_dir,
             "--seed", str(args.seed + i),
         ]
-        if args.mode in {"sim", "simacc", "acc", "accgreedy", "align", "negsim", 'norm', 'dot'}:
+        if strategy.candidate_rollouts:
             sel_cmd.extend(["--parts_root", train_parts_root])
-        if args.mode == "acc":
-            sel_cmd.extend(["--acc_low", str(args.acc_low), "--acc_high", str(args.acc_high)])
+        sel_cmd.extend(["--acc_low", str(args.acc_low), "--acc_high", str(args.acc_high)])
         print("Executing:", " ".join(sel_cmd))
         subprocess.run(sel_cmd, check=True)
 
