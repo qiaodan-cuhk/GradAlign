@@ -227,6 +227,22 @@ def test_heldout_content_and_run_identity(experiment, tmp_path, monkeypatch):
             record_experiment(tmp_path, args, roles)
 
 
+def test_standalone_megatron_merge_gets_private_rendezvous(tmp_path, monkeypatch):
+    import merge_model
+
+    commands = []
+    monkeypatch.delenv("WORLD_SIZE", raising=False)
+    monkeypatch.setattr(merge_model.subprocess, "run", lambda cmd, check: commands.append(cmd))
+    merge_model.run_merge("actor", str(tmp_path / "merged"), "megatron")
+    assert "torch.distributed.run" in commands[-1] and "--standalone" in commands[-1]
+    monkeypatch.setenv("WORLD_SIZE", "1")
+    merge_model.run_merge("actor", str(tmp_path / "merged"), "megatron")
+    assert "torch.distributed.run" not in commands[-1]
+    monkeypatch.delenv("WORLD_SIZE")
+    merge_model.run_merge("actor", str(tmp_path / "merged"), "fsdp")
+    assert "torch.distributed.run" not in commands[-1]
+
+
 def test_online_similarity_reuses_per_question_scores_on_retry(experiment, monkeypatch):
     import aggregate
 

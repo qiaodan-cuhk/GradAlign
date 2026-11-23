@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import math
-import os
 from pprint import pprint
 import sys
 from pathlib import Path
@@ -59,15 +58,9 @@ def init_minimal_megatron(tp_size: int, pp_size: int) -> None:
     """Initialize Megatron parallel groups in a single-process environment."""
 
     if not torch.distributed.is_initialized():
-        os.environ.setdefault("RANK", "0")
-        os.environ.setdefault("LOCAL_RANK", "0")
-        os.environ.setdefault("WORLD_SIZE", "1")
-        os.environ.setdefault("MASTER_ADDR", "localhost")
-        os.environ.setdefault("MASTER_PORT", "12355")
-
         torch.distributed.init_process_group(
             backend="gloo",
-            init_method="env://",
+            store=torch.distributed.HashStore(),
             world_size=1,
             rank=0,
         )

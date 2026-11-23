@@ -4,6 +4,7 @@ import os
 import argparse
 import subprocess
 import sys
+from pathlib import Path
 
 
 def build_local_dir(experiment_name: str, step: int, ckpt_root: str) -> str:
@@ -15,9 +16,14 @@ def build_target_dir(output_model_name: str, step: int, dest_root: str) -> str:
 
 
 def run_merge(local_dir: str, target_dir: str, backend: str = "megatron") -> None:
-    os.makedirs(os.path.dirname(target_dir), exist_ok=True)
+    Path(target_dir).parent.mkdir(parents=True, exist_ok=True)
+    launcher = [sys.executable]
+    if backend == "megatron" and "WORLD_SIZE" not in os.environ:
+        # The upstream standalone fallback binds a fixed port. Let torchrun
+        # allocate and own this job's rendezvous until the merge child exits.
+        launcher.extend(["-m", "torch.distributed.run", "--standalone", "--nnodes=1", "--nproc-per-node=1"])
     cmd = [
-        sys.executable, "-m", "verl.model_merger", "merge",
+        *launcher, "-m", "verl.model_merger", "merge",
         "--backend", backend,
         "--local_dir", local_dir,
         "--target_dir", target_dir,
