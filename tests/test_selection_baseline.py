@@ -117,6 +117,48 @@ def test_experiment_yaml_and_cli_drive_the_same_registry(experiment, tmp_path, m
             dynamic_selection.main()
 
 
+def test_gpu_hour_ledger_counts_selection_failures_and_grpo_once(tmp_path, monkeypatch):
+    import timing
+
+    ticks = iter([0, 900, 900, 1800, 1800, 3600])
+    monkeypatch.setattr(timing.time, "monotonic", lambda: next(ticks))
+    with timing.measure_stage(tmp_path, "selection", 2, step=0):
+        pass
+    with pytest.raises(InterruptedError):
+        with timing.measure_stage(tmp_path, "selection", 2, step=0):
+            raise InterruptedError
+    with timing.measure_stage(tmp_path, "grpo_and_heldout", 2, target_step=10):
+        (tmp_path / "latest_checkpointed_iteration.txt").write_text("10")
+    events = [json.loads(line) for line in (tmp_path / "timings.jsonl").read_text().splitlines()]
+    assert [row["cumulative_gpu_hours"] for row in events] == [0.5, 1.0, 2.0]
+    assert [row["status"] for row in events] == ["ok", "failed", "ok"]
+    assert events[-1]["grpo_step_start"] == 0 and events[-1]["grpo_step_end"] == 10
+
+
+@pytest.mark.parametrize("backend", ["fsdp", "megatron"])
+def test_trainer_receives_heldout_rollouts_and_absolute_checkpoint_root(experiment, tmp_path, monkeypatch, backend):
+    import launch_verl_training as training
+
+    root = tmp_path / "custom-checkpoints"
+    resume = root / "run/global_step_10"
+    argv = ["launch_verl_training", "--prefix", "test", "--model", "toy", "--model_path", "local-model",
+            "--train_dataset", "train", "--heldout_eval", "heldout", "--backend", backend,
+            "--ckpts_root", str(root), "--exp_name", "run", "--total_training_steps", "20",
+            "--rollout_n", "16", "--resume_from_path", str(resume), "--allocated_gpus", "2"]
+    seen = []
+    monkeypatch.setattr(sys, "argv", argv)
+    monkeypatch.setattr(training.subprocess, "run", lambda cmd, check: seen.append(cmd))
+    training.main()
+    command, = seen
+    expected = {"actor_rollout_ref.rollout.n=16", f"trainer.default_local_dir={root}/run",
+                f"data.train_files={tmp_path}/train/train.parquet", f"data.val_files={tmp_path}/heldout/train.parquet",
+                "trainer.total_training_steps=20", "trainer.resume_mode=resume_path",
+                f"trainer.resume_from_path={resume}"}
+    assert expected <= set(command)
+    event = json.loads((root / "run/timings.jsonl").read_text())
+    assert event["stage"] == "grpo_and_heldout" and event["allocated_gpus"] == 2
+
+
 @pytest.mark.parametrize("answer, expected, correct", [
     (r"work then \boxed{0.5}", r"\frac{1}{2}", True),
     (r"\boxed{0.5} then \boxed{2}", r"\frac{1}{2}", False),

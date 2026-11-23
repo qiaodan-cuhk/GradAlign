@@ -18,6 +18,7 @@ from config import add_dataset_roles, get_dataset_dir, parse_experiment_args
 from experiment import describe_datasets, record_experiment, run_lock
 from checkpoints import TRACKER, atomic_text, hf_weights_ready, latest_complete, mark_complete, resume_arguments
 from select_data import SELECTOR_REGISTRY
+from timing import measure_stage
 from launch_verl_training import DEFAULT_CHECKPOINT_ROOT, DEFAULT_ROLLOUT_N, build_exp_name
 
 
@@ -142,6 +143,7 @@ def main():
 
     # Inference controls
     parser.add_argument("--analysis_gpus", type=int, default=8)
+    parser.add_argument("--allocated_gpus", type=int, help="GPUs reserved for the duration of this run, for cost accounting")
     parser.add_argument("--minibatch_size", type=int, default=8)
     parser.add_argument("--n_samples_train", type=int, default=32)
     parser.add_argument("--n_samples_val", type=int, default=128)
@@ -169,6 +171,8 @@ def main():
     strategy = SELECTOR_REGISTRY[args.mode]
     if args.rollout_n < 1:
         parser.error("--rollout_n must be positive")
+    if args.allocated_gpus is not None and args.allocated_gpus < 0:
+        parser.error("--allocated_gpus must be nonnegative")
     args.ckpt_root = os.path.abspath(os.path.expanduser(args.ckpt_root))
     if min(args.chunk_size, args.k, args.train_batch_size, args.iters_per_select, args.num_selections,
            args.n_samples_train, args.n_samples_val, args.min_problems, args.analysis_gpus) < 1 or args.max_problems < args.min_problems:
@@ -346,7 +350,8 @@ def select_round(args, strategy, exp_name, chunk, val_dir, step_root, round_inde
 
 def run_rounds(args, strategy, exp_name, train_dir, val_dir, heldout_dir):
     checkpoint_dir = Path(args.ckpt_root) / exp_name
-    chunks, chunk_size = prepare_chunks(args, train_dir, checkpoint_dir / "chunks")
+    with measure_stage(checkpoint_dir, "prepare_chunks", args.allocated_gpus):
+        chunks, chunk_size = prepare_chunks(args, train_dir, checkpoint_dir / "chunks")
     candidate_count = max(0, min(chunk_size, args.max_problems) - args.min_problems + 1)
     size = candidate_count // args.k
     if size < args.train_batch_size:
@@ -359,8 +364,9 @@ def run_rounds(args, strategy, exp_name, train_dir, val_dir, heldout_dir):
             if not (iter_out / "train.parquet").is_file():
                 raise RuntimeError(f"Missing selected dataset for in-round resume at step {resume_step}: {iter_out}")
         else:
-            select_round(args, strategy, exp_name, chunks[i % len(chunks)], val_dir,
-                         checkpoint_dir / f"global_step_{gstep}", i, iter_out, size)
+            with measure_stage(checkpoint_dir, "selection", args.allocated_gpus, step=gstep):
+                select_round(args, strategy, exp_name, chunks[i % len(chunks)], val_dir,
+                             checkpoint_dir / f"global_step_{gstep}", i, iter_out, size)
 
         selected_count = pq.read_metadata(iter_out / "train.parquet").num_rows
         if selected_count < args.train_batch_size:
@@ -389,6 +395,8 @@ def run_rounds(args, strategy, exp_name, train_dir, val_dir, heldout_dir):
             train_cmd.extend(["--reward_manager", args.reward_manager])
         if args.reward_path:
             train_cmd.extend(["--reward_path", args.reward_path])
+        if args.allocated_gpus is not None:
+            train_cmd.extend(["--allocated_gpus", str(args.allocated_gpus)])
             
         with resume_arguments(checkpoint_dir, resume_step, resume_step == gstep) as resume_args:
             train_cmd.extend(resume_args)

@@ -10,6 +10,7 @@ from pathlib import Path
 from config import get_model_path, get_dataset_dir
 from checkpoints import atomic_text
 from experiment import describe_datasets
+from timing import measure_stage
 
 
 DEFAULT_CHECKPOINT_ROOT = "~/data_selection/data/chkpt"
@@ -74,6 +75,7 @@ def main():
 
     # Trainer settings
     parser.add_argument("--n_gpus_per_node", type=int, default=8)
+    parser.add_argument("--allocated_gpus", type=int, help="Dedicated GPU allocation for the wall-time cost ledger")
     parser.add_argument("--nnodes", type=int, default=1)
     parser.add_argument("--save_freq", type=int, default=2)
     parser.add_argument("--test_freq", type=int, default=5)
@@ -96,6 +98,8 @@ def main():
     args = parser.parse_args()
     if args.rollout_n < 1:
         parser.error("--rollout_n must be positive")
+    if args.allocated_gpus is not None and args.allocated_gpus < 0:
+        parser.error("--allocated_gpus must be nonnegative")
 
     # Resolve model path and dataset directories if not explicitly provided
     model_path = args.model_path or get_model_path(args.model)
@@ -230,7 +234,8 @@ def main():
         cmd.append(f"trainer.total_training_steps={args.total_training_steps}")
 
     print("Executing:\n" + " \\n+    \n".join(cmd))
-    subprocess.run(cmd, check=True)
+    with measure_stage(ckpts_dir, "grpo_and_heldout", args.allocated_gpus, target_step=args.total_training_steps):
+        subprocess.run(cmd, check=True)
     print(f"Training launched. Checkpoints at: {ckpts_dir}")
 
 
