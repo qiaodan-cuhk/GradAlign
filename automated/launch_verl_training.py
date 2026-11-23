@@ -76,6 +76,8 @@ def main():
     parser.add_argument("--test_freq", type=int, default=5)
     parser.add_argument("--total_epochs", type=int, default=1500)
     parser.add_argument("--resume_mode", type=str, default="auto")
+    parser.add_argument("--resume_from_path", help="Exact verified global_step checkpoint to restore")
+    parser.add_argument("--total_training_steps", type=int, help="Stop at this absolute GRPO step")
     # Optional override for experiment naming to keep it fixed across iterations
     parser.add_argument("--exp_name", default=None, type=str, help="Override experiment name (otherwise derived)")
 
@@ -211,6 +213,12 @@ def main():
             f"trainer.default_local_dir={ckpts_dir}",
             f"reward_model.reward_manager={args.reward_manager}",
         ]
+
+    if args.resume_from_path:
+        cmd = [arg for arg in cmd if not arg.startswith("trainer.resume_mode=")]
+        cmd.extend(["trainer.resume_mode=resume_path", f"trainer.resume_from_path={args.resume_from_path}"])
+    if args.total_training_steps is not None:
+        cmd.append(f"trainer.total_training_steps={args.total_training_steps}")
 
     print("Executing:\n" + " \\n+    \n".join(cmd))
     subprocess.run(cmd, check=True)
