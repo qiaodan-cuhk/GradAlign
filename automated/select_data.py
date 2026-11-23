@@ -100,14 +100,18 @@ def _scores(path, key, pool):
 
 def select_from_chunk(mode, dataset_dir, parts_root, n, output_dir, *,
                       similarity_filename="similarity_results_aggregated.jsonl",
-                      acc_low=0.2, acc_high=0.8, limit=None, rng=None):
+                      acc_low=0.2, acc_high=0.8, limit=None, rng=None,
+                      first_problem=1, last_problem=None):
     strategy = SELECTOR_REGISTRY[mode]
     source = Path(dataset_dir) / "train.jsonl"
     with source.open(encoding="utf-8") as f:
         ids = [row["extra_info"]["index"] for row in map(json.loads, f)]
-    pool = set(ids)
-    if len(pool) != len(ids):
+    if len(set(ids)) != len(ids):
         raise ValueError(f"Duplicate candidate IDs in {source}")
+    if first_problem < 1 or (last_problem is not None and last_problem < first_problem):
+        raise ValueError("Invalid candidate problem range")
+    ids = ids[first_problem - 1:last_problem]
+    pool = set(ids)
     if n <= 0:
         raise ValueError("Selection size must be positive")
     parts = Path(parts_root) if parts_root is not None else None
@@ -169,12 +173,16 @@ def main():
     parser.add_argument("--acc_low", type=float, default=0.2)
     parser.add_argument("--acc_high", type=float, default=0.8)
     parser.add_argument("--lim", type=int)
+    parser.add_argument("--min_problems", type=int, default=1)
+    parser.add_argument("--max_problems", type=int)
     parser.add_argument("--seed", type=int, help="Round-specific selection seed")
     parser.add_argument("--similarity_filename", default="similarity_results_aggregated.jsonl")
     parser.add_argument("--output_dir")
     parser.add_argument("--parts_root")
     args = parser.parse_args()
 
+    if args.mode in ("rand", "rand_in_chunk") and not args.candidate_dir:
+        parser.error("Random selection requires an explicit --candidate_dir")
     directory = args.candidate_dir or get_dataset_dir(args.dataset, args.model)
     parts = args.parts_root
     if parts is None and SELECTOR_REGISTRY[args.mode].candidate_rollouts:
@@ -184,7 +192,8 @@ def main():
         name += f"_{args.acc_low}_{args.acc_high}"
     out = args.output_dir or Path(directory) / "selected" / args.model / f"{name}_{args.n}"
     select_from_chunk(args.mode, directory, parts, args.n, out, similarity_filename=args.similarity_filename,
-                      acc_low=args.acc_low, acc_high=args.acc_high, limit=args.lim, rng=random.Random(args.seed))
+                      acc_low=args.acc_low, acc_high=args.acc_high, limit=args.lim, rng=random.Random(args.seed),
+                      first_problem=args.min_problems, last_problem=args.max_problems)
     print(f"Selection complete. Output: {out}")
 
 

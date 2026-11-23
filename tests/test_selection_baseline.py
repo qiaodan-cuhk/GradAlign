@@ -29,6 +29,19 @@ def read_ids(directory):
     return [json.loads(line)["extra_info"]["index"] for line in (directory / "train.jsonl").read_text().splitlines()]
 
 
+def test_standalone_random_requires_chunk_and_honors_candidate_window(tmp_path, monkeypatch):
+    pool = write_dataset(tmp_path, "candidates", [109, 101, 123, 104, 160])
+    out = tmp_path / "selected"
+    argv = ["select_data.py", "--mode", "rand", "--dataset", "candidates", "--model", "toy",
+            "--n", "2", "--min_problems", "2", "--max_problems", "3", "--output_dir", str(out)]
+    monkeypatch.setattr(sys, "argv", argv)
+    with pytest.raises(SystemExit):
+        select_data.main()
+    monkeypatch.setattr(sys, "argv", argv + ["--candidate_dir", str(pool)])
+    select_data.main()
+    assert read_ids(out) == [101, 123]
+
+
 @pytest.fixture
 def experiment(tmp_path, monkeypatch):
     monkeypatch.setattr(datasets.config, "HF_DATASETS_CACHE", tmp_path / "hf-cache")

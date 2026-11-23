@@ -339,13 +339,15 @@ def select_round(args, strategy, exp_name, chunk, val_dir, step_root, round_inde
         run_script("aggregate.py", "--model_name", args.model, "--dataset", args.train_dataset, "--parts_root", parts)
     run_script("select_data.py", "--mode", args.mode, "--dataset", args.train_dataset, "--model", args.model,
                "--n", size, "--output_dir", output, "--candidate_dir", chunk, "--seed", args.seed + round_index,
+               "--min_problems", args.min_problems, "--max_problems", args.max_problems,
                "--parts_root", parts, "--acc_low", args.acc_low, "--acc_high", args.acc_high)
 
 
 def run_rounds(args, strategy, exp_name, train_dir, val_dir, heldout_dir):
     checkpoint_dir = Path(args.ckpt_root) / exp_name
     chunks, chunk_size = prepare_chunks(args, train_dir, checkpoint_dir / "chunks")
-    size = chunk_size // args.k
+    candidate_count = max(0, min(chunk_size, args.max_problems) - args.min_problems + 1)
+    size = candidate_count // args.k
     if size < args.train_batch_size:
         raise ValueError(f"Selected subset of {size} cannot form one batch of {args.train_batch_size}")
     resume_step = latest_complete(checkpoint_dir, args.iters_per_select, args.merge_backend)
@@ -359,6 +361,9 @@ def run_rounds(args, strategy, exp_name, train_dir, val_dir, heldout_dir):
             select_round(args, strategy, exp_name, chunks[i % len(chunks)], val_dir,
                          checkpoint_dir / f"global_step_{gstep}", i, iter_out, size)
 
+        selected_count = pq.read_metadata(iter_out / "train.parquet").num_rows
+        if selected_count < args.train_batch_size:
+            raise ValueError(f"{args.mode} selected {selected_count} problems for a batch of {args.train_batch_size}")
         # 5) Launch training with selected set, fixed experiment name
         end_step = gstep + args.iters_per_select
         train_cmd = [
