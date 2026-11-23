@@ -61,6 +61,8 @@ def payload_ready(directory, backend):
     import pickle
 
     try:
+        if json.loads((dist / "metadata.json").read_text()).get("sharded_backend") != "torch_dist":
+            return False
         metadata = FileSystemReader(dist).read_metadata()
         storage = metadata.storage_data
         if not storage:
@@ -72,8 +74,11 @@ def payload_ready(directory, backend):
             )
         if any((dist / name).stat().st_size < size for name, size in required_sizes.items()):
             return False
-        has_model = any(key.startswith("model") for key in metadata.state_dict_metadata)
-        return has_model or hf_weights_ready(actor / "huggingface")
+        keys = metadata.state_dict_metadata.keys()
+        has_optimizer = any(key == "optimizer" or key.startswith("optimizer.") for key in keys)
+        has_model = any(key.startswith("model") or
+                        (not key.startswith("optimizer.") and key.endswith((".weight", ".bias"))) for key in keys)
+        return has_optimizer and (has_model or hf_weights_ready(actor / "huggingface"))
     except (OSError, ValueError, EOFError, AttributeError, pickle.UnpicklingError):
         return False
 

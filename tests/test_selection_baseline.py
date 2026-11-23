@@ -132,6 +132,51 @@ def test_checkpoint_resume_with_partial_and_completed_steps(tmp_path):
     assert (boundary / "data.pt").read_bytes() == b"sampler"
 
 
+def test_interrupted_round_restores_its_sampler_then_switches_chunks(experiment, monkeypatch):
+    for flag in ("--iters_per_select", "--num_selections"):
+        experiment[experiment.index(flag) + 1] = "2"
+    selected_chunks = []
+    attempts = []
+
+    def dispatch(cmd, check):
+        def option(flag):
+            return cmd[cmd.index(flag) + 1]
+
+        if Path(cmd[1]).name == "select_data.py":
+            selected_chunks.append(Path(option("--candidate_dir")).name)
+            with monkeypatch.context() as m:
+                m.setattr(sys, "argv", cmd[1:])
+                select_data.main()
+            return
+        assert Path(cmd[1]).name == "launch_verl_training.py"
+        target = int(option("--total_training_steps"))
+        root = Path(option("--ckpts_root")) / option("--exp_name")
+        attempts.append(target)
+        if len(attempts) == 1:
+            assert option("--resume_mode") == "disable"
+            fake_checkpoint(root, 1)
+            raise InterruptedError
+        resume = Path(option("--resume_from_path"))
+        if target == 2:
+            assert resume == root / "global_step_1"
+            assert (resume / "data.pt").is_file()
+        else:
+            assert target == 4
+            assert (resume / "actor").resolve() == root / "global_step_2/actor"
+            assert not (resume / "data.pt").exists()
+            assert (root / "global_step_2/data.pt").is_file()
+        fake_checkpoint(root, target)
+
+    monkeypatch.setattr(dynamic_selection.subprocess, "run", dispatch)
+    monkeypatch.setattr(sys, "argv", experiment)
+    with pytest.raises(InterruptedError):
+        dynamic_selection.main()
+    dynamic_selection.main()
+    dynamic_selection.main()
+    assert attempts == [2, 2, 4]
+    assert selected_chunks == ["chunk_0", "chunk_1"]
+
+
 def test_megatron_checkpoint_checks_indexed_tensor_storage(tmp_path):
     import torch
     import torch.distributed.checkpoint as dcp
@@ -144,6 +189,19 @@ def test_megatron_checkpoint_checks_indexed_tensor_storage(tmp_path):
     assert payload_ready(tmp_path, "megatron")
     next(dist.glob("*.distcp")).write_bytes(b"truncated")
     assert not payload_ready(tmp_path, "megatron")
+
+    for name, tensors, expected in [
+        ("weights_only", {"decoder.final_layernorm.weight": torch.ones(2)}, False),
+        ("optimizer_only", {"optimizer.state.exp_avg.decoder.weight": torch.ones(2)}, False),
+        ("sharded", {"decoder.final_layernorm.weight": torch.ones(2),
+                     "optimizer.state.exp_avg.decoder.weight": torch.zeros(2)}, True),
+    ]:
+        checkpoint = tmp_path / name
+        dist = checkpoint / "actor/dist_ckpt"
+        dcp.save(tensors, checkpoint_id=dist)
+        (dist / "common.pt").write_bytes(b"common")
+        (dist / "metadata.json").write_text('{"sharded_backend": "torch_dist"}')
+        assert payload_ready(checkpoint, "megatron") is expected
 
 
 def test_heldout_content_and_run_identity(experiment, tmp_path, monkeypatch):
