@@ -167,3 +167,57 @@ def test_heldout_content_and_run_identity(experiment, tmp_path, monkeypatch):
         args.seed = 43
         with pytest.raises(ValueError, match="settings or data changed"):
             record_experiment(tmp_path, args, roles)
+
+
+def test_online_similarity_reuses_per_question_scores_on_retry(experiment, monkeypatch):
+    import aggregate
+
+    experiment[experiment.index("--mode") + 1] = "sim"
+    experiment.extend(["--n_samples_train", "2", "--n_samples_val", "3"])
+    seen = []
+    attempts = 0
+
+    def dispatch(cmd, check):
+        nonlocal attempts
+        stage = Path(cmd[1]).name
+        seen.append(stage)
+
+        def option(flag):
+            return cmd[cmd.index(flag) + 1]
+
+        if stage == "run_inference_local.py":
+            prompts = Path(option("--prompts_file"))
+            ids = read_ids(prompts.parent)
+            out = Path(option("--output_dir")) / "responses_sorted.json"
+            rows = [{"group_id": i, "sample_id": j, "is_correct": j == 0}
+                    for i in ids for j in range(int(option("--n_samples")))]
+            out.write_text(json.dumps(rows))
+        elif stage == "run_parallel_analysis.py":
+            ids = read_ids(Path(option("--problem_set_path")).parent)
+            part = Path(option("--parts_root")) / "part_0"
+            (part / "similarity_results_cosine_real.jsonl").write_text("".join(
+                json.dumps({"group_id": i, "similarity": float(i)}) + "\n" for i in ids))
+        elif stage in ("select_data.py", "aggregate.py"):
+            with monkeypatch.context() as m:
+                m.setattr(sys, "argv", cmd[1:] + (["--num_workers", "1"] if stage == "aggregate.py" else []))
+                (aggregate.main if stage == "aggregate.py" else select_data.main)()
+        elif stage == "launch_verl_training.py":
+            assert option("--heldout_eval") == "heldout"
+            assert Path(option("--val_dir")).name == "heldout"
+            root = Path(option("--ckpts_root")) / option("--exp_name")
+            pool = read_ids(root / "chunks/chunk_0")
+            assert set(read_ids(Path(option("--train_dir")))) == set(sorted(pool)[-3:])
+            attempts += 1
+            if attempts == 1:
+                raise InterruptedError("simulated interruption before the update")
+            fake_checkpoint(root, 1)
+        else:
+            pytest.fail(stage)
+
+    monkeypatch.setattr(dynamic_selection.subprocess, "run", dispatch)
+    monkeypatch.setattr(sys, "argv", experiment)
+    with pytest.raises(InterruptedError):
+        dynamic_selection.main()
+    dynamic_selection.main()
+    assert seen.count("run_inference_local.py") == 2
+    assert seen.count("run_parallel_analysis.py") == 1

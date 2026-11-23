@@ -5,6 +5,10 @@ import json
 import argparse
 import subprocess
 import sys
+import math
+import tempfile
+from itertools import islice
+import pyarrow.parquet as pq
 from pathlib import Path
 from typing import List, Tuple
 
@@ -12,7 +16,7 @@ import datasets as hfds  # type: ignore[import-not-found]
 
 from config import add_dataset_roles, get_dataset_dir
 from experiment import describe_datasets, record_experiment, run_lock
-from checkpoints import TRACKER, hf_weights_ready, latest_complete, mark_complete, resume_arguments
+from checkpoints import TRACKER, atomic_text, hf_weights_ready, latest_complete, mark_complete, resume_arguments
 from select_data import SELECTOR_REGISTRY
 from launch_verl_training import DEFAULT_CHECKPOINT_ROOT, DEFAULT_ROLLOUT_N, build_exp_name
 
@@ -94,33 +98,8 @@ def chunk_dataset(train_dir: str, exp_root: str, train_parquet: str, chunk_size:
         "seed": seed,
         "train_parquet": train_parquet,
     }
-    with open(os.path.join(exp_root, "manifest.json"), "w", encoding="utf-8") as f:
-        json.dump(manifest, f, ensure_ascii=False, indent=2)
+    atomic_text(Path(exp_root) / "manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
     return num_chunks, chunk_dirs
-
-
-def _set_random_seed(seed: int) -> None:
-    # os.environ["PYTHONHASHSEED"] = str(seed)
-    try:
-        import random as _random
-        _random.seed(seed)
-    except Exception:
-        pass
-    try:
-        import numpy as _np  # type: ignore
-        _np.random.seed(seed)
-    except Exception:
-        pass
-    # try:
-    #     import torch as _torch  # type: ignore
-    #     _torch.manual_seed(seed)
-    #     if _torch.cuda.is_available():
-    #         _torch.cuda.manual_seed_all(seed)
-    #     if hasattr(_torch.backends, "cudnn"):
-    #         _torch.backends.cudnn.deterministic = True
-    #         _torch.backends.cudnn.benchmark = False
-    # except Exception:
-    #     pass
 
 
 def main():
@@ -161,6 +140,7 @@ def main():
     parser.add_argument("--rollout_n", type=int, default=DEFAULT_ROLLOUT_N, help="Fresh GRPO training answers per selected prompt")
 
     # Inference controls
+    parser.add_argument("--analysis_gpus", type=int, default=8)
     parser.add_argument("--minibatch_size", type=int, default=8)
     parser.add_argument("--n_samples_train", type=int, default=32)
     parser.add_argument("--n_samples_val", type=int, default=128)
@@ -189,8 +169,11 @@ def main():
     if args.rollout_n < 1:
         parser.error("--rollout_n must be positive")
     args.ckpt_root = os.path.abspath(os.path.expanduser(args.ckpt_root))
-    _set_random_seed(args.seed)
-    assert  (args.k * args.train_batch_size * args.iters_per_select) % args.chunk_size == 0
+    if min(args.chunk_size, args.k, args.train_batch_size, args.iters_per_select, args.num_selections,
+           args.n_samples_train, args.n_samples_val, args.min_problems, args.analysis_gpus) < 1 or args.max_problems < args.min_problems:
+        parser.error("Batch sizes, round counts and the problem range must be positive")
+    if args.chunk_size < args.k:
+        parser.error("The selection ratio must leave at least one candidate")
 
     # Resolve dataset dirs when not explicitly provided
     train_dir = args.train_dir or get_dataset_dir(args.train_dataset, args.model)
@@ -216,274 +199,165 @@ def main():
         run_rounds(args, strategy, exp_name, train_dir, val_dir, heldout_dir)
 
 
-def run_rounds(args, strategy, exp_name, train_dir, val_dir, heldout_dir):
+def run_script(script, *arguments):
+    cmd = [sys.executable, str(Path(__file__).with_name(script)), *map(str, arguments)]
+    print("Executing:", " ".join(cmd), flush=True)
+    subprocess.run(cmd, check=True)
 
-    # Prepare experiment checkpoint root and chunk storage under it
-    # ckpt_root/{exp_name}/chunks/chunk_{i}
-    exp_ckpt_root = os.path.join(args.ckpt_root, exp_name)
-    os.makedirs(exp_ckpt_root, exist_ok=True)
-    chunks_root = os.path.join(exp_ckpt_root, "chunks")
-    os.makedirs(chunks_root, exist_ok=True)
 
-    # 1) Chunk (idempotent with auto-resume): if chunks already exist, skip splitting
-    existing_chunks = [d for d in os.listdir(chunks_root) if d.startswith("chunk_") and os.path.isdir(os.path.join(chunks_root, d))]
-    if existing_chunks:
-        existing_chunks.sort(key=lambda name: int(name.split("_")[-1]))
-        num_chunks = len(existing_chunks)
-        chunk_dirs = [os.path.join(chunks_root, d) for d in existing_chunks]
-        print(f"Found existing {num_chunks} chunks under {chunks_root}; skipping chunking")
+def prepare_chunks(args, train_dir, root):
+    manifest = root / "manifest.json"
+    if manifest.is_file():
+        info = json.loads(manifest.read_text())
+        count = info["num_chunks"]
+        size = min(info["total_rows"], args.chunk_size)
+        if (info["seed"], info["chunk_size"], info["train_parquet"]) != (args.seed, size, args.train_parquet):
+            raise ValueError(f"Chunk manifest does not match this experiment: {manifest}")
+        chunks = [root / f"chunk_{i}" for i in range(count)]
+        if all((chunk / "train.jsonl").is_file() and (chunk / "train.parquet").is_file()
+               and pq.read_metadata(chunk / "train.parquet").num_rows == size for chunk in chunks):
+            return chunks, size
+    _, chunks = chunk_dataset(train_dir, str(root), args.train_parquet, args.chunk_size, args.seed)
+    return list(map(Path, chunks)), pq.read_metadata(Path(chunks[0]) / "train.parquet").num_rows
+
+
+def responses_complete(path, ids, samples):
+    if not path.is_file():
+        return False
+    try:
+        with path.open(encoding="utf-8") as f:
+            records = json.load(f)
+        if not isinstance(records, list) or len(records) != len(ids) * samples:
+            return False
+        seen = set()
+        for row in records:
+            key = (row["group_id"], row["sample_id"])
+            if (key[0] not in ids or not 0 <= key[1] < samples or key in seen
+                    or not isinstance(row.get("passed", row.get("is_correct")), bool)):
+                return False
+            seen.add(key)
+    except (KeyError, ValueError, TypeError, AttributeError):
+        return False
+    return True
+
+
+def ensure_rollouts(args, dataset, prompts, directory, model_path, samples, batch_size):
+    directory.mkdir(parents=True, exist_ok=True)
+    with prompts.open(encoding="utf-8") as f:
+        ids = {json.loads(line)["extra_info"]["index"] for line in islice(f, args.min_problems - 1, args.max_problems)}
+    if not ids:
+        raise ValueError(f"No prompts in requested range: {prompts}")
+    sorted_file = directory / "responses_sorted.json"
+    if responses_complete(sorted_file, ids, samples):
+        return ids
+    if responses_complete(directory / "responses.json", ids, samples):
+        run_script("sort_responses.py", "--model_name", args.model, "--dataset", dataset, "--responses_dir", directory)
     else:
-        num_chunks, chunk_dirs = chunk_dataset(train_dir, chunks_root, args.train_parquet, args.chunk_size, args.seed)
-        print(f"Manifest written at {os.path.join(chunks_root, 'manifest.json')}")
+        options = ["--model_path", model_path] if model_path else []
+        if args.use_model_judge or Path(args.reward_path or "").name == "model_reward.py":
+            options.append("--use_model_judge")
+        run_script("run_inference_local.py", "--model", args.model, "--resp_dataset", dataset,
+                   "--prompts_file", prompts, "--output_dir", directory, "--n_samples", samples,
+                   "--min_problems", args.min_problems, "--max_problems", args.max_problems,
+                   "--temperature", args.temperature, "--max_tokens", args.max_tokens,
+                   "--tensor_parallel_size", args.tensor_parallel_size, "--pipeline_parallel_size", args.pipeline_parallel_size,
+                   "--batch_size", batch_size, "--max_model_len", args.max_model_len, "--concurrency", args.concurrency,
+                   *options)
+    if not responses_complete(sorted_file, ids, samples):
+        raise RuntimeError(f"Incomplete rollout groups in {sorted_file}")
+    return ids
 
-    # Selection size per iteration
-    select_n = args.chunk_size // args.k
 
-    # Precompute chunk sizes (dataset rows per chunk) for resume logic
-    def _count_lines(path: str) -> int:
-        n = 0
-        with open(path, "r", encoding="utf-8") as f:
-            for _ in f:
-                n += 1
-        return n
+def analysis_complete(part, reference, ids, mode):
+    # The analyzer appends one row per problem and resumes by group_id.
+    inputs = {}
+    for role, folder in (("candidate", part), ("reference", reference)):
+        stat = (folder / "responses_sorted.json").stat()
+        inputs[role] = [stat.st_size, stat.st_mtime_ns]
+    inputs["mode"] = mode
+    manifest = part / "analysis_inputs.json"
+    scores = part / "similarity_results_cosine_real.jsonl"
+    matching = manifest.is_file() and json.loads(manifest.read_text()) == inputs
+    if matching and scores.exists():
+        found = set()
+        try:
+            with scores.open() as f:
+                for row in map(json.loads, f):
+                    gid = int(row["group_id"])
+                    if gid in found or gid not in ids or not math.isfinite(float(row["similarity"])):
+                        raise ValueError("invalid similarity")
+                    found.add(gid)
+            return found == ids
+        except (ValueError, TypeError, KeyError):
+            pass
+    if scores.exists():
+        backup = Path(tempfile.mkdtemp(prefix=".previous-analysis-", dir=part))
+        for artifact in part.glob("similarity_results_cosine_real*"):
+            artifact.rename(backup / artifact.name)
+    atomic_text(manifest, json.dumps(inputs))
+    return False
 
-    chunk_sizes = []
-    for d in chunk_dirs:
-        chunk_sizes.append(_count_lines(os.path.join(d, "train.jsonl")))
 
-    checkpoint_dir = Path(exp_ckpt_root)
+def select_round(args, strategy, exp_name, chunk, val_dir, step_root, round_index, output, size):
+    step = round_index * args.iters_per_select
+    parts = step_root / "train_split"
+    part = parts / "part_0"
+    options = []
+    model_path = None
+    if step and strategy.candidate_rollouts:
+        model_path = step_root / "actor" / "huggingface"
+        if not hf_weights_ready(model_path):
+            model_path = step_root / "merged"
+            if not hf_weights_ready(model_path):
+                run_script("merge_model.py", "--experiment_name", exp_name, "--step", step, "--output_model_name", exp_name,
+                           "--backend", args.merge_backend, "--ckpt_root", args.ckpt_root, "--target_dir", model_path)
+        options.extend(["--model_path", model_path])
+        if args.use_optimizer and strategy.gradient:
+            optimizer = step_root / "opt_converted"
+            run_script("convert_megatron_optimizer_to_hf.py", "--checkpoint_path", step_root / "actor",
+                       "--hf-config", model_path, "--output", optimizer)
+            options.extend(["--use_optimizer", "--optimizer_state_path", optimizer])
+    prompts = chunk / "train.jsonl"
+    if strategy.candidate_rollouts:
+        ids = ensure_rollouts(args, args.train_dataset, prompts, part, model_path, args.n_samples_train,
+                              args.train_infer_batch_size)
+    reference = part
+    if strategy.reference_rollouts:
+        reference = step_root / "val_responses"
+        ensure_rollouts(args, args.selection_reference, Path(val_dir) / "train.jsonl", reference, model_path,
+                        args.n_samples_val, args.val_infer_batch_size)
+    if strategy.gradient and not analysis_complete(part, reference, ids, strategy.gradient):
+        run_script("run_parallel_analysis.py", "--size", 1, "--idx", 0, "--model", args.model,
+                   "--resp_dataset", args.train_dataset, "--problem_dataset", args.train_dataset,
+                   "--problem_set_path", prompts, "--val_dataset", args.selection_reference or args.train_dataset,
+                   "--parts_root", parts, "--val_responses_dir", reference, "--num_gpus", args.analysis_gpus,
+                   "--mini_batch_size", args.minibatch_size, "--mixed_precision", "bf16",
+                   "--max_length", args.max_model_len, "--mode", strategy.gradient, *options)
+        if not analysis_complete(part, reference, ids, strategy.gradient):
+            raise RuntimeError(f"Incomplete candidate gradient scores in {part}")
+    if strategy.gradient or strategy.use_accuracy:
+        run_script("aggregate.py", "--model_name", args.model, "--dataset", args.train_dataset, "--parts_root", parts)
+    run_script("select_data.py", "--mode", args.mode, "--dataset", args.train_dataset, "--model", args.model,
+               "--n", size, "--output_dir", output, "--candidate_dir", chunk, "--seed", args.seed + round_index,
+               "--parts_root", parts, "--acc_low", args.acc_low, "--acc_high", args.acc_high)
+
+
+def run_rounds(args, strategy, exp_name, train_dir, val_dir, heldout_dir):
+    checkpoint_dir = Path(args.ckpt_root) / exp_name
+    chunks, chunk_size = prepare_chunks(args, train_dir, checkpoint_dir / "chunks")
+    size = chunk_size // args.k
+    if size < args.train_batch_size:
+        raise ValueError(f"Selected subset of {size} cannot form one batch of {args.train_batch_size}")
     resume_step = latest_complete(checkpoint_dir, args.iters_per_select, args.merge_backend)
-    i_start = resume_step // args.iters_per_select
-    val_lines = _count_lines(os.path.join(val_dir, "train.jsonl")) if val_dir else 0
-
-    for i in range(i_start, args.num_selections):
-        chunk_idx = i % num_chunks
-        chunk_dir = os.path.join(chunks_root, f"chunk_{chunk_idx}")
-        prompts_file = os.path.join(chunk_dir, "train.jsonl")
-        # Fixed global step directory naming to align with VERL
+    for i in range(resume_step // args.iters_per_select, args.num_selections):
         gstep = i * args.iters_per_select
-        step_root = os.path.join(exp_ckpt_root, f"global_step_{gstep}")
-        train_parts_root = os.path.join(step_root, "train_split")
-        val_dir_override = os.path.join(step_root, "val_responses")
-        train_resp_dir = os.path.join(train_parts_root, "part_0")
-        os.makedirs(train_resp_dir, exist_ok=True)
-        os.makedirs(val_dir_override, exist_ok=True)
-
-        iter_out = os.path.join(exp_ckpt_root, "selected", f"iter_{i}_{args.mode}_{select_n}")
+        iter_out = checkpoint_dir / "selected" / f"iter_{i}_{args.mode}_{size}"
         if resume_step > gstep:
-            if not os.path.isfile(os.path.join(iter_out, "train.parquet")):
+            if not (iter_out / "train.parquet").is_file():
                 raise RuntimeError(f"Missing selected dataset for in-round resume at step {resume_step}: {iter_out}")
         else:
-            # 2) If i>0: merge previous iteration checkpoint and override model path
-            merged_model_path = None
-            if i > 0 and strategy.candidate_rollouts:
-                # Expect VERL to have produced checkpoints under ckpt_root/{prefix}_sel{iter-1}_{model}_{train_dataset}_{train_name}_{val_name}/global_step_{i}
-                # We'll merge that step to dest_root and use it for inference/analysis
-                train_name = os.path.basename(os.path.normpath(train_dir))
-                val_name = os.path.basename(os.path.normpath(val_dir))
-                # Use fixed experiment name rather than per-iter suffix
-                exp_prev = exp_name
-                # Write merged model directly into exp ckpt dir at this global step
-                merged_target = os.path.join(exp_ckpt_root, f"global_step_{gstep}", "merged")
-                os.makedirs(merged_target, exist_ok=True)
-                merge_cmd = [
-                    sys.executable, os.path.join(os.path.dirname(__file__), "merge_model.py"),
-                    "--experiment_name", exp_prev,
-                    "--step", str(i * args.iters_per_select),
-                    "--output_model_name", f"{exp_prev}",
-                    "--backend", args.merge_backend,
-                    "--ckpt_root", args.ckpt_root,
-                    "--dest_root", os.path.join(args.ckpt_root, "merged_models"),
-                    "--target_dir", merged_target,
-                ]
-                print("Executing:", " ".join(merge_cmd))
-                hf_dir = Path(step_root) / "actor" / "huggingface"
-                if hf_weights_ready(hf_dir):
-                    merged_model_path = str(hf_dir)
-                else:
-                    subprocess.run(merge_cmd, check=True)
-                    merged_model_path = merged_target
-                if args.use_optimizer:
-                    optimizer_state_path = os.path.join(step_root, "opt_converted")
-                    convert_cmd = [
-                        sys.executable, os.path.join(os.path.dirname(__file__), "convert_megatron_optimizer_to_hf.py"),
-                        "--checkpoint_path", os.path.join(step_root, "actor"),
-                        "--hf-config", merged_model_path,
-                        "--output", optimizer_state_path,
-                    ]
-                    print("Executing:", " ".join(convert_cmd))
-                    subprocess.run(convert_cmd, check=True)
-                    if not os.path.isfile(optimizer_state_path):
-                        raise SystemExit(f"Optimizer state not found: {optimizer_state_path}")
-
-            # 3) Local training inference → responses.json in step-root train_split/part_0
-            infer_cmd = [
-                sys.executable, os.path.join(os.path.dirname(__file__), "run_inference_local.py"),
-                "--model", args.model,
-                "--resp_dataset", args.train_dataset,
-                "--prompts_file", prompts_file,
-                "--output_part", "0",
-                "--parts_root", train_parts_root,
-                *( ["--model_path", merged_model_path] if merged_model_path else [] ),
-                "--n_samples", str(args.n_samples_train),
-                "--min_problems", str(args.min_problems),
-                "--max_problems", str(args.max_problems),
-                "--temperature", str(args.temperature),
-                "--max_tokens", str(args.max_tokens),
-                "--tensor_parallel_size", str(args.tensor_parallel_size),
-                "--pipeline_parallel_size", str(args.pipeline_parallel_size),
-                "--batch_size", str(args.train_infer_batch_size),
-                "--max_model_len", str(args.max_model_len),
-                "--concurrency", str(args.concurrency),
-            ]
-            if args.use_model_judge or os.path.basename(args.reward_path or "") == "model_reward.py":
-                infer_cmd.append("--use_model_judge")
-            # infer_cmd.extend(["--model_judge_concurrency", str(max(1, args.concurrency))])
-
-            # Skip train inference if responses already complete
-            expected_train = chunk_sizes[chunk_idx] * args.n_samples_train
-            train_part_dir = os.path.join(train_parts_root, "part_0")
-            resp_json = os.path.join(train_part_dir, "responses.json")
-            resp_sorted = os.path.join(train_part_dir, "responses_sorted.json")
-            actual_train = 0
-            if os.path.isfile(resp_json):
-                try:
-                    with open(resp_json, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                        if isinstance(data, list):
-                            actual_train = len(data)
-                except json.JSONDecodeError:
-                    actual_train = 0
-            elif os.path.isfile(resp_sorted):
-                try:
-                    with open(resp_sorted, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                        if isinstance(data, list):
-                            actual_train = len(data)
-                except json.JSONDecodeError:
-                    actual_train = 0
-            if actual_train >= expected_train and expected_train > 0:
-                print(f"Skip train inference for step {i}: found {actual_train}/{expected_train} responses")
-            elif strategy.candidate_rollouts:
-                print("Executing:", " ".join(infer_cmd))
-                subprocess.run(infer_cmd, check=True)
-
-            # 3b) Local validation inference → responses.json in step-root val_responses (flat)
-            if strategy.reference_rollouts:
-                val_prompts_file = os.path.join(val_dir, "train.jsonl")
-                if not os.path.isfile(val_prompts_file):
-                    raise SystemExit(f"Validation prompts not found: {val_prompts_file}")
-                infer_val_cmd = [
-                    sys.executable, os.path.join(os.path.dirname(__file__), "run_inference_local.py"),
-                    "--model", args.model,
-                    "--resp_dataset", args.selection_reference,
-                    "--prompts_file", val_prompts_file,
-                    "--output_part", "0",
-                    "--output_dir", val_dir_override,
-                    *( ["--model_path", merged_model_path] if merged_model_path else [] ),
-                    "--n_samples", str(args.n_samples_val),
-                    "--min_problems", str(args.min_problems),
-                    "--max_problems", str(args.max_problems),
-                    "--temperature", str(args.temperature),
-                    "--max_tokens", str(args.max_tokens),
-                    "--tensor_parallel_size", str(args.tensor_parallel_size),
-                    "--pipeline_parallel_size", str(args.pipeline_parallel_size),
-                    "--batch_size", str(args.val_infer_batch_size),
-                    "--max_model_len", str(args.max_model_len),
-                    "--concurrency", str(args.concurrency),
-                ]
-                if args.use_model_judge or os.path.basename(args.reward_path or "") == "model_reward.py":
-                    infer_val_cmd.append("--use_model_judge")
-                    # infer_val_cmd.extend(["--model_judge_concurrency", str(max(1, args.concurrency))])
-                # Skip val inference if responses already complete
-                expected_val = val_lines * args.n_samples_val if val_lines > 0 else 0
-                val_resp_json = os.path.join(val_dir_override, "responses.json")
-                val_resp_sorted = os.path.join(val_dir_override, "responses_sorted.json")
-                actual_val = 0
-                if os.path.isfile(val_resp_sorted):
-                    try:
-                        with open(val_resp_sorted, "r", encoding="utf-8") as f:
-                            v = json.load(f)
-                            if isinstance(v, list):
-                                actual_val = len(v)
-                    except json.JSONDecodeError:
-                        actual_val = 0
-                elif os.path.isfile(val_resp_sorted):
-                    try:
-                        with open(val_resp_sorted, "r", encoding="utf-8") as f:
-                            v = json.load(f)
-                            if isinstance(v, list):
-                                actual_val = len(v)
-                    except json.JSONDecodeError:
-                        actual_val = 0
-                if expected_val > 0 and actual_val >= expected_val:
-                    print(f"Skip val inference for step {i}: found {actual_val}/{expected_val} responses")
-                else:
-                    print("Executing:", " ".join(infer_val_cmd))
-                    subprocess.run(infer_val_cmd, check=True)
-
-            # 3) Analysis and aggregation (for sim/simacc)
-            if strategy.gradient:
-                if not strategy.reference_rollouts:
-                    val_dir_override = train_resp_dir
-                ana_cmd = [
-                    sys.executable, os.path.join(os.path.dirname(__file__), "run_parallel_analysis.py"),
-                    "--size", "1",
-                    "--idx", "0",
-                    "--model", args.model,
-                    "--resp_dataset", args.train_dataset,
-                    "--problem_dataset", args.train_dataset,
-                    "--val_dataset", args.selection_reference if strategy.reference_rollouts else args.train_dataset,
-                    "--parts_root", train_parts_root,
-                    "--val_responses_dir", val_dir_override,
-                    "--num_gpus", "8",
-                    "--mini_batch_size", str(args.minibatch_size),
-                    "--mixed_precision", "bf16",
-                    "--max_length", str(args.max_model_len),
-                ]
-                if merged_model_path:
-                    ana_cmd.extend(["--model_path", merged_model_path])
-                ana_cmd.extend(["--mode", strategy.gradient])
-                if args.use_optimizer and merged_model_path:
-                    ana_cmd.extend(["--use_optimizer", "--optimizer_state_path", optimizer_state_path])
-                # Skip analysis if per-response similarity already computed
-                sim_path = os.path.join(train_part_dir, "similarity_results_cosine_real.jsonl")
-                sim_lines = _count_lines(sim_path) if os.path.isfile(sim_path) else 0
-                if sim_lines >= expected_train and expected_train > 0:
-                    print(f"Skip analysis for step {i}: found {sim_lines}/{expected_train} similarity rows")
-                else:
-                    print("Executing:", " ".join(ana_cmd))
-                    subprocess.run(ana_cmd, check=True)
-
-
-            # Aggregate accuracy and copy similarity
-            if strategy.gradient or strategy.use_accuracy:
-                agg_cmd = [
-                    sys.executable, os.path.join(os.path.dirname(__file__), "aggregate.py"),
-                    "--model_name", args.model,
-                    "--dataset", args.train_dataset,
-                    "--parts_root", train_parts_root,
-                ]
-                print("Executing:", " ".join(agg_cmd))
-                subprocess.run(agg_cmd, check=True)
-
-            # 4) Select top-N according to mode
-            os.makedirs(iter_out, exist_ok=True)
-            sel_cmd = [
-                sys.executable, os.path.join(os.path.dirname(__file__), "select_data.py"),
-                "--mode", args.mode,
-                "--dataset", args.train_dataset,
-                "--model", args.model,
-                "--n", str(select_n),
-                "--output_dir", iter_out,
-                "--candidate_dir", chunk_dir,
-                "--seed", str(args.seed + i),
-            ]
-            if strategy.candidate_rollouts:
-                sel_cmd.extend(["--parts_root", train_parts_root])
-            sel_cmd.extend(["--acc_low", str(args.acc_low), "--acc_high", str(args.acc_high)])
-            print("Executing:", " ".join(sel_cmd))
-            subprocess.run(sel_cmd, check=True)
+            select_round(args, strategy, exp_name, chunks[i % len(chunks)], val_dir,
+                         checkpoint_dir / f"global_step_{gstep}", i, iter_out, size)
 
         # 5) Launch training with selected set, fixed experiment name
         end_step = gstep + args.iters_per_select
@@ -495,7 +369,7 @@ def run_rounds(args, strategy, exp_name, train_dir, val_dir, heldout_dir):
             "--heldout_eval", args.heldout_eval,
             "--val_dir", heldout_dir,
             "--val_parquet", args.heldout_parquet,
-            "--train_dir", iter_out,
+            "--train_dir", str(iter_out),
             "--total_epochs", str(end_step),  # upper bound; the absolute step below controls the budget
             "--total_training_steps", str(end_step),
             "--exp_name", exp_name,

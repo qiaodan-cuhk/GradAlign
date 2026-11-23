@@ -29,6 +29,8 @@ def main():
     # Problem set used in analysis
     parser.add_argument("--problem_dataset", required=True, type=str, help="Dataset name for prompts")
 
+    parser.add_argument("--problem_set_path", help="Exact candidate JSONL used for these responses")
+
     # Validation responses directory used by analysis
     parser.add_argument("--val_dataset", required=True, type=str, help="Validation responses dataset name")
     parser.add_argument("--val_responses_dir", default=None, type=str, help="Override validation responses directory")
@@ -54,7 +56,7 @@ def main():
     # assert 0 <= args.idx < args.size, "idx must be in [0, size)"
 
     parts_root = args.parts_root or (get_response_dir(args.resp_dataset, args.model) + "_split")
-    problem_set = os.path.join(get_dataset_dir(args.problem_dataset, args.model), "train.jsonl")
+    problem_set = args.problem_set_path or os.path.join(get_dataset_dir(args.problem_dataset, args.model), "train.jsonl")
     val_responses_dir = args.val_responses_dir or get_response_dir(args.val_dataset, args.model)
 
     if not os.path.isfile(problem_set):
@@ -68,7 +70,7 @@ def main():
     launcher = os.path.join(parallel_dir, "launch_parallel_analysis.py")
 
     # Resolve model path from CLI override, env, or config
-    model_path = args.model_path or os.environ.get("MODEL_PATH_OVERRIDE", get_model_path(args.model))
+    model_path = args.model_path or os.environ.get("MODEL_PATH_OVERRIDE") or get_model_path(args.model)
 
     k = args.start_k
     processed_any = False
