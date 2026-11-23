@@ -40,7 +40,7 @@ def experiment(tmp_path, monkeypatch):
         "dynamic_selection", "--prefix", "toy", "--model", "toy-model", "--train_dataset", "train",
         "--val_dataset", "reference", "--verl_val_set", "heldout", "--chunk_size", "6", "--k", "2",
         "--train_batch_size", "3", "--iters_per_select", "1", "--num_selections", "1",
-        "--mode", "rand", "--seed", "42", "--ckpt_root", str(tmp_path / "checkpoints"),
+        "--mode", "rand", "--seed", "42", "--rollout_n", "16", "--ckpt_root", str(tmp_path / "checkpoints"),
     ]
 
 
@@ -62,7 +62,10 @@ def test_random_uses_only_current_chunk(experiment, monkeypatch):
             assert set(selected) <= set(pool)
             assert datasets.Dataset.from_parquet(str(out / "train.parquet"))["extra_info"][0]["index"] in selected
             selections.append(selected)
-        elif stage != "launch_verl_training.py":
+        elif stage == "launch_verl_training.py":
+            assert cmd[cmd.index("--rollout_n") + 1] == "16"
+            assert cmd[cmd.index("--ckpts_root") + 1] == experiment[experiment.index("--ckpt_root") + 1]
+        else:
             pytest.fail(f"Random selection attempted an unexpected stage: {stage}")
 
     monkeypatch.setattr(dynamic_selection.subprocess, "run", dispatch)

@@ -10,7 +10,7 @@ from typing import List, Tuple
 import datasets as hfds  # type: ignore[import-not-found]
 
 from config import get_dataset_dir, get_response_dir
-from launch_verl_training import build_exp_name
+from launch_verl_training import DEFAULT_CHECKPOINT_ROOT, DEFAULT_ROLLOUT_N, build_exp_name
 
 
 def _load_train_dataset(train_dir: str, train_parquet: str):
@@ -153,6 +153,8 @@ def main():
     parser.add_argument("--iters_per_select", type=int, required=True,
                         help="Number of training iterations per selection (compute top N = batch_size * iters_per_select)")
 
+    parser.add_argument("--rollout_n", type=int, default=DEFAULT_ROLLOUT_N, help="Fresh GRPO training answers per selected prompt")
+
     # Inference controls
     parser.add_argument("--minibatch_size", type=int, default=8)
     parser.add_argument("--n_samples_train", type=int, default=32)
@@ -172,12 +174,15 @@ def main():
     parser.add_argument("--reward_path", type=str, default=None)
     
     # Checkpoint/merge controls
-    parser.add_argument("--ckpt_root", type=str, default="",
+    parser.add_argument("--ckpt_root", type=str, default=DEFAULT_CHECKPOINT_ROOT,
                         help="Root directory where VERL checkpoints are saved")
     parser.add_argument("--merge_backend", type=str, default="megatron")
     parser.add_argument("--verl_val_set", type=str, default="amc_mc_aime_amc_mmlupro")
 
     args = parser.parse_args()
+    if args.rollout_n < 1:
+        parser.error("--rollout_n must be positive")
+    args.ckpt_root = os.path.abspath(os.path.expanduser(args.ckpt_root))
     _set_random_seed(args.seed)
     assert  (args.k * args.train_batch_size * args.iters_per_select) % args.chunk_size == 0
     train_epochs = (args.k * args.train_batch_size * args.iters_per_select) // args.chunk_size
@@ -476,6 +481,9 @@ def main():
             "--train_dir", iter_out,
             "--total_epochs", f'{(i+1) * train_epochs}',
             "--exp_name", exp_name,
+            "--rollout_n", str(args.rollout_n),
+            "--ckpts_root", args.ckpt_root,
+            "--backend", args.merge_backend,
             '--train_batch_size', str(args.train_batch_size),
             '--max_response_length', str(args.max_tokens),
         ]

@@ -4,8 +4,14 @@ import os
 import argparse
 import subprocess
 import sys
+from pathlib import Path
 
 from config import get_model_path, get_dataset_dir
+
+
+DEFAULT_CHECKPOINT_ROOT = "~/data_selection/data/chkpt"
+DEFAULT_ROLLOUT_N = 32
+VERL_PACKAGE = Path(__file__).resolve().parents[1] / "verl" / "verl"
 
 
 def build_exp_name(prefix: str, model_name: str, train_dataset, train_dir: str, val_dir: str) -> str:
@@ -28,7 +34,7 @@ def main():
 
     # Optional overrides / settings
     parser.add_argument("--project_name", default="Dynamic-restart", type=str)
-    parser.add_argument("--ckpts_root", default="~/data_selection/data/chkpt", type=str)
+    parser.add_argument("--ckpts_root", "--ckpt_root", default=DEFAULT_CHECKPOINT_ROOT, type=str)
     parser.add_argument("--train_parquet", default="train.parquet", type=str, help="Filename of training parquet inside train_dir")
     parser.add_argument("--val_parquet", default="train.parquet", type=str, help="Filename of validation parquet inside val_dir")
 
@@ -47,7 +53,7 @@ def main():
 
     # Rollout/ref settings
     parser.add_argument("--rollout_name", default="vllm", type=str)
-    parser.add_argument("--rollout_n", type=int, default=32)
+    parser.add_argument("--rollout_n", type=int, default=DEFAULT_ROLLOUT_N)
     parser.add_argument("--rollout_val_do_sample", action="store_true", default=True)
     parser.add_argument("--rollout_val_temperature", type=float, default=0.7)
     parser.add_argument("--rollout_val_n", type=int, default=16)
@@ -74,7 +80,7 @@ def main():
     parser.add_argument("--exp_name", default=None, type=str, help="Override experiment name (otherwise derived)")
 
     # Paths to config and reward function
-    parser.add_argument("--config_path", default="~/data_selection/verl/verl/trainer/config", type=str)
+    parser.add_argument("--config_path", default=str(VERL_PACKAGE / "trainer" / "config"), type=str)
     parser.add_argument("--config_name", default="ppo_megatron_trainer.yaml", type=str)
     # parser.add_argument("--reward_path", default="math_reward.py", type=str)
     parser.add_argument("--reward_path", default="math_reward.py", type=str)
@@ -83,6 +89,8 @@ def main():
     parser.add_argument("--reward_manager", default="naive", type=str)
 
     args = parser.parse_args()
+    if args.rollout_n < 1:
+        parser.error("--rollout_n must be positive")
 
     # Resolve model path and dataset directories if not explicitly provided
     model_path = args.model_path or get_model_path(args.model)
@@ -91,7 +99,11 @@ def main():
 
     exp_name = args.exp_name or build_exp_name(args.prefix, args.model, args.train_dataset, train_dir, val_dir)
     print('exp', exp_name)
-    ckpts_dir = os.path.join(args.ckpts_root, exp_name)
+    ckpts_dir = str(Path(args.ckpts_root).expanduser().resolve() / exp_name)
+    args.config_path = str(Path(args.config_path).expanduser().resolve())
+    reward_path = Path(args.reward_path).expanduser()
+    if not reward_path.is_absolute():
+        reward_path = VERL_PACKAGE / "utils" / "reward_score" / reward_path
     os.makedirs(ckpts_dir, exist_ok=True)
 
     train_file = os.path.join(train_dir, args.train_parquet)
@@ -142,7 +154,7 @@ def main():
             "actor_rollout_ref.ref.megatron.param_offload=True",
             f"actor_rollout_ref.rollout.gpu_memory_utilization={args.gpu_memory_utilization}",
             "trainer.logger=['console','tensorboard']",
-            f"custom_reward_function.path=~/data_selection/verl/verl/utils/reward_score/{args.reward_path}",
+            f"custom_reward_function.path={reward_path}",
             f"custom_reward_function.name={args.reward_name}",
             f"trainer.project_name={args.project_name}",
             f"trainer.experiment_name={exp_name}",
@@ -186,7 +198,7 @@ def main():
             "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=40",
             f"actor_rollout_ref.rollout.gpu_memory_utilization={args.gpu_memory_utilization}",
             "trainer.logger=['console','tensorboard']",
-            f"custom_reward_function.path=~/data_selection/verl/verl/utils/reward_score/{args.reward_path}",
+            f"custom_reward_function.path={reward_path}",
             f"custom_reward_function.name={args.reward_name}",
             f"trainer.project_name={args.project_name}",
             f"trainer.experiment_name={exp_name}",
@@ -197,6 +209,7 @@ def main():
             f"trainer.total_epochs={args.total_epochs}",
             f"trainer.resume_mode={args.resume_mode}",
             f"trainer.default_local_dir={ckpts_dir}",
+            f"reward_model.reward_manager={args.reward_manager}",
         ]
 
     print("Executing:\n" + " \\n+    \n".join(cmd))
