@@ -81,10 +81,13 @@ BASE_RESPONSES_DIR = "/path/to/responses"
 
 `verl/verl/utils/reward_score/model_reward.py` contains the async model-judge path used by this codebase. Configure your API client/service there before running experiments that enable model judging.
 
-### 2.3 Important path assumption
+### 2.3 Experiment inputs
 
-`automated/launch_verl_training.py` currently assumes VERL config/reward files under `~/data_selection/...` by default.  
-If your repo path differs, update that script or pass matching paths/overrides before launching large runs.
+Use `--selection_reference amc22` to guide gradient-based selection and `--heldout_eval amc23` for evaluation.
+The runner checks normalized user prompts for holdout overlap and records the resolved datasets and settings in
+`experiment.json`. Use a separate prefix for each method and seed. For legacy runs without a manifest,
+`--adopt_legacy_run` records the settings you supply after you verify the original run.
+The launcher resolves the bundled veRL configuration and reward paths relative to this checkout.
 
 ## 3) Data preparation
 
@@ -130,7 +133,7 @@ python dynamic_selection.py \
   --prefix gradalign_exp \
   --model qwen3-8b-base \
   --train_dataset webinstruct \
-  --val_dataset amc22 \
+  --selection_reference amc22 \
   --chunk_size 5120 \
   --k 20 \
   --mode sim \
@@ -143,7 +146,7 @@ python dynamic_selection.py \
   --max_tokens 3072 \
   --max_model_len 4096 \
   --ckpt_root /path/to/checkpoints \
-  --verl_val_set amc22
+  --heldout_eval amc23
 ```
 
 Important arguments:
@@ -167,7 +170,7 @@ python dynamic_selection.py \
   --prefix random_baseline \
   --model qwen3-8b-base \
   --train_dataset webinstruct \
-  --val_dataset amc22 \
+  --selection_reference amc22 \
   --chunk_size 5120 \
   --k 20 \
   --mode rand \
@@ -175,7 +178,7 @@ python dynamic_selection.py \
   --train_batch_size 128 \
   --iters_per_select 10 \
   --ckpt_root /path/to/checkpoints \
-  --verl_val_set amc22
+  --heldout_eval amc23
 ```
 
 Direct GRPO training without data selection:
@@ -186,7 +189,7 @@ python launch_verl_training.py \
   --prefix grpo_baseline \
   --model qwen3-8b-base \
   --train_dataset webinstruct \
-  --val_dataset amc22 \
+  --heldout_eval amc23 \
   --train_batch_size 128 \
   --max_response_length 3072 \
   --total_epochs 1000

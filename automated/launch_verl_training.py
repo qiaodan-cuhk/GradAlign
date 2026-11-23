@@ -4,9 +4,12 @@ import os
 import argparse
 import subprocess
 import sys
+import json
 from pathlib import Path
 
 from config import get_model_path, get_dataset_dir
+from checkpoints import atomic_text
+from experiment import describe_datasets
 
 
 DEFAULT_CHECKPOINT_ROOT = "~/data_selection/data/chkpt"
@@ -25,7 +28,7 @@ def main():
     parser.add_argument("--prefix", required=True, type=str, help="Experiment name prefix")
     parser.add_argument("--model", required=True, type=str, help="Tokenizer/model key (used to resolve model path and dataset dirs)")
     parser.add_argument("--train_dataset", required=True, type=str, help="Training dataset key (used to resolve dataset dir)")
-    parser.add_argument("--val_dataset", required=True, type=str, help="Validation dataset key (used to resolve dataset dir)")
+    parser.add_argument("--heldout_eval", "--val_dataset", dest="heldout_eval", required=True, type=str, help="Validation dataset key (used to resolve dataset dir)")
 
     # Optional explicit overrides
     parser.add_argument("--model_path", default=None, type=str, help="Override base model path to fine-tune")
@@ -97,7 +100,7 @@ def main():
     # Resolve model path and dataset directories if not explicitly provided
     model_path = args.model_path or get_model_path(args.model)
     train_dir = args.train_dir or get_dataset_dir(args.train_dataset, args.model)
-    val_dir = args.val_dir or get_dataset_dir(args.val_dataset, args.model)
+    val_dir = args.val_dir or get_dataset_dir(args.heldout_eval, args.model)
 
     exp_name = args.exp_name or build_exp_name(args.prefix, args.model, args.train_dataset, train_dir, val_dir)
     print('exp', exp_name)
@@ -110,6 +113,12 @@ def main():
 
     train_file = os.path.join(train_dir, args.train_parquet)
     val_file = os.path.join(val_dir, args.val_parquet)
+
+    roles = describe_datasets((args.train_dataset, train_file), None, (args.heldout_eval, val_file))
+    atomic_text(Path(ckpts_dir) / "training_inputs.json", json.dumps({
+        "datasets": roles, "rollout_n": args.rollout_n, "train_batch_size": args.train_batch_size,
+        "target_step": args.total_training_steps,
+    }, indent=2) + "\n")
 
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
 

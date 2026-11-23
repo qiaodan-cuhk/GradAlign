@@ -78,3 +78,11 @@ def get_response_dir(dataset_label: str, model_name: str) -> str:
 get_output_dir = get_dataset_dir
 
 
+def add_dataset_roles(parser):
+    """The historical argument aliases remain valid in existing experiment scripts."""
+    parser.add_argument("--selection_reference", "--val_dataset", dest="selection_reference",
+                        help="Dataset used to estimate selection gradients")
+    parser.add_argument("--heldout_eval", "--verl_val_set", dest="heldout_eval", required=True,
+                        help="Disjoint dataset used to report model performance")
+    parser.add_argument("--heldout_dir", help="Override the directory containing the evaluation Parquet")
+    parser.add_argument("--heldout_parquet", default="train.parquet")

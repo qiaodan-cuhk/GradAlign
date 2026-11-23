@@ -144,3 +144,26 @@ def test_megatron_checkpoint_checks_indexed_tensor_storage(tmp_path):
     assert payload_ready(tmp_path, "megatron")
     next(dist.glob("*.distcp")).write_bytes(b"truncated")
     assert not payload_ready(tmp_path, "megatron")
+
+
+def test_heldout_content_and_run_identity(experiment, tmp_path, monkeypatch):
+    from experiment import describe_datasets, record_experiment, run_lock
+    from argparse import Namespace
+
+    heldout = ("heldout", tmp_path / "heldout/train.parquet")
+    alias_path = tmp_path / "alias.jsonl"
+    alias_path.write_text(json.dumps({"prompt": [{"role": "user", "content": "heldout  question  0"}]}))
+    with pytest.raises(ValueError, match="overlaps heldout_eval"):
+        describe_datasets(("train", tmp_path / "train/train.jsonl"), ("alias", alias_path), heldout)
+    roles = describe_datasets(("train", tmp_path / "train/train.jsonl"), None, heldout)
+    with run_lock(tmp_path):
+        with pytest.raises(RuntimeError, match="already owns"):
+            with run_lock(tmp_path):
+                pass
+        args = Namespace(seed=42, num_selections=1, adopt_legacy_run=False)
+        record_experiment(tmp_path, args, roles)
+        args.num_selections = 2
+        record_experiment(tmp_path, args, roles)
+        args.seed = 43
+        with pytest.raises(ValueError, match="settings or data changed"):
+            record_experiment(tmp_path, args, roles)

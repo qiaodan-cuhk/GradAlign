@@ -10,7 +10,8 @@ from typing import List, Tuple
 
 import datasets as hfds  # type: ignore[import-not-found]
 
-from config import get_dataset_dir
+from config import add_dataset_roles, get_dataset_dir
+from experiment import describe_datasets, record_experiment, run_lock
 from checkpoints import TRACKER, hf_weights_ready, latest_complete, mark_complete, resume_arguments
 from select_data import SELECTOR_REGISTRY
 from launch_verl_training import DEFAULT_CHECKPOINT_ROOT, DEFAULT_ROLLOUT_N, build_exp_name
@@ -127,7 +128,8 @@ def main():
     parser.add_argument("--prefix", required=True, type=str)
     parser.add_argument("--model", required=True, type=str)
     parser.add_argument("--train_dataset", required=True, type=str)
-    parser.add_argument("--val_dataset", required=True, type=str)
+    add_dataset_roles(parser)
+    parser.add_argument("--adopt_legacy_run", action="store_true", help="Record settings for a pre-manifest run after verifying its original configuration")
 
     # Optional explicit overrides (to perfectly match experiment naming)
     parser.add_argument("--train_dir", default=None, type=str,
@@ -181,7 +183,6 @@ def main():
     parser.add_argument("--ckpt_root", type=str, default=DEFAULT_CHECKPOINT_ROOT,
                         help="Root directory where VERL checkpoints are saved")
     parser.add_argument("--merge_backend", type=str, default="megatron")
-    parser.add_argument("--verl_val_set", type=str, default="amc_mc_aime_amc_mmlupro")
 
     args = parser.parse_args()
     strategy = SELECTOR_REGISTRY[args.mode]
@@ -193,12 +194,29 @@ def main():
 
     # Resolve dataset dirs when not explicitly provided
     train_dir = args.train_dir or get_dataset_dir(args.train_dataset, args.model)
-    val_dir = args.val_dir or get_dataset_dir(args.val_dataset, args.model)
+    if strategy.reference_rollouts and not args.selection_reference:
+        parser.error(f"{args.mode} requires --selection_reference")
+    val_dir = args.val_dir or (get_dataset_dir(args.selection_reference) if args.selection_reference else None)
+    heldout_dir = args.heldout_dir or get_dataset_dir(args.heldout_eval)
+    train_dir = str(Path(train_dir).expanduser().resolve())
+    val_dir = str(Path(val_dir).expanduser().resolve()) if val_dir else None
+    heldout_dir = str(Path(heldout_dir).expanduser().resolve())
 
     # Use a fixed experiment name (prefix + model + datasets) to align with VERL checkpoints
-    exp_name = build_exp_name(args.prefix, args.model, args.train_dataset, train_dir, val_dir)
-    exp_root = os.path.join(train_dir, exp_name)
-    os.makedirs(exp_root, exist_ok=True)
+    exp_name = build_exp_name(args.prefix, args.model, args.train_dataset, train_dir, val_dir or "no_reference")
+    root = Path(args.ckpt_root) / exp_name
+    with run_lock(root):
+        source = Path(train_dir) / args.train_parquet
+        if not source.is_file():
+            source = Path(train_dir) / "train.jsonl"
+        roles = describe_datasets((args.train_dataset, source),
+                                  (args.selection_reference, Path(val_dir) / "train.jsonl") if val_dir else None,
+                                  (args.heldout_eval, Path(heldout_dir) / args.heldout_parquet))
+        record_experiment(root, args, roles)
+        run_rounds(args, strategy, exp_name, train_dir, val_dir, heldout_dir)
+
+
+def run_rounds(args, strategy, exp_name, train_dir, val_dir, heldout_dir):
 
     # Prepare experiment checkpoint root and chunk storage under it
     # ckpt_root/{exp_name}/chunks/chunk_{i}
@@ -236,7 +254,7 @@ def main():
     checkpoint_dir = Path(exp_ckpt_root)
     resume_step = latest_complete(checkpoint_dir, args.iters_per_select, args.merge_backend)
     i_start = resume_step // args.iters_per_select
-    val_lines = _count_lines(os.path.join(val_dir, "train.jsonl")) if os.path.isfile(os.path.join(val_dir, "train.jsonl")) else 0
+    val_lines = _count_lines(os.path.join(val_dir, "train.jsonl")) if val_dir else 0
 
     for i in range(i_start, args.num_selections):
         chunk_idx = i % num_chunks
@@ -358,7 +376,7 @@ def main():
                 infer_val_cmd = [
                     sys.executable, os.path.join(os.path.dirname(__file__), "run_inference_local.py"),
                     "--model", args.model,
-                    "--resp_dataset", args.val_dataset,
+                    "--resp_dataset", args.selection_reference,
                     "--prompts_file", val_prompts_file,
                     "--output_part", "0",
                     "--output_dir", val_dir_override,
@@ -415,7 +433,7 @@ def main():
                     "--model", args.model,
                     "--resp_dataset", args.train_dataset,
                     "--problem_dataset", args.train_dataset,
-                    "--val_dataset", args.val_dataset if strategy.reference_rollouts else args.train_dataset,
+                    "--val_dataset", args.selection_reference if strategy.reference_rollouts else args.train_dataset,
                     "--parts_root", train_parts_root,
                     "--val_responses_dir", val_dir_override,
                     "--num_gpus", "8",
@@ -474,7 +492,9 @@ def main():
             "--prefix", args.prefix,
             "--model", args.model,
             "--train_dataset", args.train_dataset,
-            "--val_dataset", args.verl_val_set,
+            "--heldout_eval", args.heldout_eval,
+            "--val_dir", heldout_dir,
+            "--val_parquet", args.heldout_parquet,
             "--train_dir", iter_out,
             "--total_epochs", str(end_step),  # upper bound; the absolute step below controls the budget
             "--total_training_steps", str(end_step),
