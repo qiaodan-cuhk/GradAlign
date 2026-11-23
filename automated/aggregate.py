@@ -68,7 +68,7 @@ def _acc_counts_for_part(part_dir: str) -> Tuple[Dict[int, int], Dict[int, int]]
         if not isinstance(item, dict):
             continue
         gid = item.get("group_id")
-        is_correct = item.get("is_correct")
+        is_correct = item.get("passed", item.get("is_correct"))
         if gid is None or not isinstance(is_correct, bool):
             continue
         total[gid] = total.get(gid, 0) + 1

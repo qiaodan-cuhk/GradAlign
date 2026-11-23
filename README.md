@@ -87,6 +87,9 @@ Use `--selection_reference amc22` to guide gradient-based selection and `--heldo
 The runner checks normalized user prompts for holdout overlap and records the resolved datasets and settings in
 `experiment.json`. Use a separate prefix for each method and seed. For legacy runs without a manifest,
 `--adopt_legacy_run` records the settings you supply after you verify the original run.
+Rollout caches carry a fingerprint of the selection grader. An unmarked cache or a changed grader
+triggers fresh rollouts for the affected selection round. Use a fresh prefix for comparisons with runs
+whose earlier training steps used the old grades.
 The launcher resolves the bundled veRL configuration and reward paths relative to this checkout.
 
 From the repository root, run either arm of the 16-training-rollout example with the same YAML.

@@ -364,7 +364,7 @@ def test_online_similarity_reuses_per_question_scores_on_retry(experiment, monke
             prompts = Path(option("--prompts_file"))
             ids = read_ids(prompts.parent)
             out = Path(option("--output_dir")) / "responses_sorted.json"
-            rows = [{"group_id": i, "sample_id": j, "is_correct": j == 0}
+            rows = [{"group_id": i, "sample_id": j, "passed": j == 0, "prompt": str(i), "response": str(j)}
                     for i in ids for j in range(int(option("--n_samples")))]
             out.write_text(json.dumps(rows))
         elif stage == "run_parallel_analysis.py":
@@ -396,6 +396,18 @@ def test_online_similarity_reuses_per_question_scores_on_retry(experiment, monke
     dynamic_selection.main()
     assert seen.count("run_inference_local.py") == 2
     assert seen.count("run_parallel_analysis.py") == 1
+
+    # An old boolean cache with the same IDs and rollout counts has a different grader.
+    checkpoint_root = Path(experiment[experiment.index("--ckpt_root") + 1])
+    outputs = next(checkpoint_root.glob("*/global_step_0/train_split/part_0"))
+    (outputs / "rollout_grader.txt").write_text("legacy comparison of extracted strings")
+    from argparse import Namespace
+    args = Namespace(min_problems=1, max_problems=6, use_model_judge=False, reward_path=None,
+                     model="toy", temperature=0.7, max_tokens=16, tensor_parallel_size=1,
+                     pipeline_parallel_size=1, max_model_len=64, concurrency=1)
+    prompts = next(checkpoint_root.glob("*/chunks/chunk_0/train.jsonl"))
+    dynamic_selection.ensure_rollouts(args, "train", prompts, outputs, None, 2, 3)
+    assert seen.count("run_inference_local.py") == 3
 
 
 @pytest.mark.parametrize("rollouts,world", [(4, 8), (16, 8), (3, 2)])

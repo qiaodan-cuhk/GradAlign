@@ -2,6 +2,7 @@
 
 import os
 import json
+import hashlib
 import argparse
 import subprocess
 import sys
@@ -20,7 +21,7 @@ from checkpoints import TRACKER, atomic_text, hf_weights_ready, latest_complete,
 from select_data import SELECTOR_REGISTRY
 from timing import measure_stage
 from launch_verl_training import (DEFAULT_CHECKPOINT_ROOT, DEFAULT_ROLLOUT_N, DEFAULT_HELDOUT_ROLLOUT_N,
-                                  DEFAULT_TEST_FREQ, build_exp_name)
+                                  DEFAULT_TEST_FREQ, VERL_PACKAGE, build_exp_name)
 
 
 def _load_train_dataset(train_dir: str, train_parquet: str):
@@ -240,7 +241,8 @@ def responses_complete(path, ids, samples):
         seen = set()
         for row in records:
             key = (row["group_id"], row["sample_id"])
-            if (key[0] not in ids or not 0 <= key[1] < samples or key in seen
+            if (type(key[1]) is not int or key[0] not in ids or not 0 <= key[1] < samples or key in seen
+                    or not isinstance(row.get("prompt"), str) or not isinstance(row.get("response"), str)
                     or not isinstance(row.get("passed", row.get("is_correct")), bool)):
                 return False
             seen.add(key)
@@ -255,14 +257,20 @@ def ensure_rollouts(args, dataset, prompts, directory, model_path, samples, batc
         ids = {json.loads(line)["extra_info"]["index"] for line in islice(f, args.min_problems - 1, args.max_problems)}
     if not ids:
         raise ValueError(f"No prompts in requested range: {prompts}")
+    use_judge = args.use_model_judge or Path(args.reward_path or "").name == "model_reward.py"
+    reward_dir = VERL_PACKAGE / "utils/reward_score"
+    grader = reward_dir / ("model_reward.py" if use_judge else "math_reward.py")
+    signature = f"{grader.name} {hashlib.sha256(grader.read_bytes()).hexdigest()}"
+    marker = directory / "rollout_grader.txt"
+    same_grader = marker.is_file() and marker.read_text() == signature
     sorted_file = directory / "responses_sorted.json"
-    if responses_complete(sorted_file, ids, samples):
+    if same_grader and responses_complete(sorted_file, ids, samples):
         return ids
-    if responses_complete(directory / "responses.json", ids, samples):
+    if same_grader and responses_complete(directory / "responses.json", ids, samples):
         run_script("sort_responses.py", "--model_name", args.model, "--dataset", dataset, "--responses_dir", directory)
     else:
         options = ["--model_path", model_path] if model_path else []
-        if args.use_model_judge or Path(args.reward_path or "").name == "model_reward.py":
+        if use_judge:
             options.append("--use_model_judge")
         run_script("run_inference_local.py", "--model", args.model, "--resp_dataset", dataset,
                    "--prompts_file", prompts, "--output_dir", directory, "--n_samples", samples,
@@ -273,6 +281,7 @@ def ensure_rollouts(args, dataset, prompts, directory, model_path, samples, batc
                    *options)
     if not responses_complete(sorted_file, ids, samples):
         raise RuntimeError(f"Incomplete rollout groups in {sorted_file}")
+    atomic_text(marker, signature)
     return ids
 
 
