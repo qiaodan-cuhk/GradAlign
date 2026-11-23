@@ -4,6 +4,7 @@ import os
 import json
 import argparse
 import random
+from itertools import islice
 from typing import List, Set, Dict, Tuple
 
 import datasets as hfds  # type: ignore[import-not-found]
@@ -104,7 +105,7 @@ def select_by_similarity(dataset_dir: str, parts_root: str, top_n: int, output_d
     _write_selected(dataset_train, selected_ids, output_dir)
 
 
-def select_by_accuracy(dataset_dir: str, parts_root: str, n: int, acc_low: float, acc_high: float, output_dir: str, lim: int | None = None) -> None:
+def select_by_accuracy(dataset_dir: str, parts_root: str, n: int, acc_low: float, acc_high: float, output_dir: str, lim: int | None = None, rng=random) -> None:
     acc_path = os.path.join(parts_root, "accuracy_by_problem.jsonl")
     assert os.path.isfile(acc_path), f"Accuracy file not found: {acc_path}"
     acc_map = _read_acc_map(acc_path)
@@ -115,7 +116,7 @@ def select_by_accuracy(dataset_dir: str, parts_root: str, n: int, acc_low: float
     if n > len(pool):
         print(f"Warning: requested {n} but only {len(pool)} available; selecting all.")
         n = len(pool)
-    selected_ids = set(random.sample(pool, n))
+    selected_ids = set(rng.sample(pool, n))
     dataset_train = os.path.join(dataset_dir, "train.jsonl")
     print('Selected', len(selected_ids))
     _write_selected(dataset_train, selected_ids, output_dir)
@@ -165,18 +166,12 @@ def select_by_accgreedy(dataset_dir: str, parts_root: str, n: int, output_dir: s
     _write_selected(dataset_train, selected_ids, output_dir)
 
 
-def select_random(dataset_dir: str, n: int, output_dir: str, max_num: int | None = None) -> None:
-    # Count lines up to max_num (if provided)
-    total = 0
-    with open(os.path.join(dataset_dir, "train.jsonl"), "r", encoding="utf-8") as f:
-        for _ in f:
-            total += 1
-            if max_num is not None and total >= int(max_num):
-                break
-    if n > total:
-        print(f"Warning: requested {n} but only {total} available; selecting all.")
-        n = total
-    selected_indices = set(sorted(random.sample(range(total), n)))
+def select_random(dataset_dir: str, n: int, output_dir: str, max_num: int | None = None, rng=random) -> None:
+    with open(os.path.join(dataset_dir, "train.jsonl"), encoding="utf-8") as source:
+        ids = [json.loads(line)["extra_info"]["index"] for line in islice(source, max_num)]
+    if len(set(ids)) != len(ids):
+        raise ValueError("Candidate problem IDs must be unique")
+    selected_indices = set(rng.sample(ids, min(n, len(ids))))
     print('Selected', len(selected_indices))
     _write_selected(os.path.join(dataset_dir, "train.jsonl"), selected_indices, output_dir)
 
@@ -194,9 +189,11 @@ def main():
     parser.add_argument("--output_dir", type=str, default=None, help="Optional explicit output directory")
     parser.add_argument("--parts_root", type=str, default=None, help="Override responses split root (compat with dynamic selection)")
 
+    parser.add_argument("--candidate_dir", help="Current candidate chunk containing train.jsonl")
+    parser.add_argument("--seed", type=int, help="Round-specific selection seed")
     args = parser.parse_args()
 
-    dataset_dir = get_dataset_dir(args.dataset, args.model)
+    dataset_dir = args.candidate_dir or get_dataset_dir(args.dataset, args.model)
     if args.output_dir is None:
         # Place selections under dataset_dir/selected/<mode-specific>
         selected_root = os.path.join(dataset_dir, "selected", args.model)
@@ -234,12 +231,12 @@ def main():
         select_by_simacc(dataset_dir, parts_root, int(args.n), output_dir, args.similarity_filename)
     elif args.mode == "acc":
         assert parts_root is not None
-        select_by_accuracy(dataset_dir, parts_root, int(args.n), float(args.acc_low), float(args.acc_high), output_dir, lim=args.lim)
+        select_by_accuracy(dataset_dir, parts_root, int(args.n), float(args.acc_low), float(args.acc_high), output_dir, lim=args.lim, rng=random.Random(args.seed))
     elif args.mode == "accgreedy":
         assert parts_root is not None
         select_by_accgreedy(dataset_dir, parts_root, int(args.n), output_dir)
     else:
-        select_random(dataset_dir, int(args.n), output_dir, max_num=args.lim)
+        select_random(dataset_dir, int(args.n), output_dir, max_num=args.lim, rng=random.Random(args.seed))
 
     print(f"Selection complete. Output: {output_dir}")
 

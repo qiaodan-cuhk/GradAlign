@@ -251,7 +251,7 @@ def main():
 
         # 2) If i>0: merge previous iteration checkpoint and override model path
         merged_model_path = None
-        if i > 0:
+        if i > 0 and args.mode != "rand":
             # Expect VERL to have produced checkpoints under ckpt_root/{prefix}_sel{iter-1}_{model}_{train_dataset}_{train_name}_{val_name}/global_step_{i}
             # We'll merge that step to dest_root and use it for inference/analysis
             train_name = os.path.basename(os.path.normpath(train_dir))
@@ -333,7 +333,9 @@ def main():
                         actual_train = len(data)
             except json.JSONDecodeError:
                 actual_train = 0
-        if actual_train >= expected_train and expected_train > 0:
+        if args.mode == "rand":
+            pass  # Uniform sampling only consumes candidate IDs.
+        elif actual_train >= expected_train and expected_train > 0:
             print(f"Skip train inference for step {i}: found {actual_train}/{expected_train} responses")
         else:
             print("Executing:", " ".join(infer_cmd))
@@ -452,6 +454,8 @@ def main():
             "--model", args.model,
             "--n", str(select_n),
             "--output_dir", iter_out,
+            "--candidate_dir", chunk_dir,
+            "--seed", str(args.seed + i),
         ]
         if args.mode in {"sim", "simacc", "acc", "accgreedy", "align", "negsim", 'norm', 'dot'}:
             sel_cmd.extend(["--parts_root", train_parts_root])
