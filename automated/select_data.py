@@ -5,7 +5,7 @@ import json
 import math
 import random
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import datasets as hfds
@@ -26,9 +26,16 @@ class SelectionInputs:
     parts_root: Path | None
 
 
+@dataclass
+class RoutedSelection:
+    """A selector can annotate every eligible prompt for a route-aware consumer."""
+    route_tags: dict[int, str]
+    align_scores: dict[int, float] = field(default_factory=dict)
+
+
 @dataclass(frozen=True)
 class Selector:
-    choose: Callable[[SelectionInputs], list[int]]
+    choose: Callable[[SelectionInputs], list[int] | RoutedSelection]
     use_accuracy: bool = False
     gradient: str | None = None
     reference_rollouts: bool = False
@@ -112,6 +119,8 @@ def select_from_chunk(mode, dataset_dir, parts_root, n, output_dir, *,
         raise ValueError("Invalid candidate problem range")
     ids = ids[first_problem - 1:last_problem]
     pool = set(ids)
+    if not pool:
+        raise ValueError(f"Empty candidate window in {source}")
     if n <= 0:
         raise ValueError("Selection size must be positive")
     parts = Path(parts_root) if parts_root is not None else None
@@ -122,21 +131,38 @@ def select_from_chunk(mode, dataset_dir, parts_root, n, output_dir, *,
         _scores(parts / similarity_filename, "similarity", pool) if strategy.gradient else {},
         n, rng if rng is not None else random.Random(), acc_low, acc_high, limit, parts,
     )
-    chosen = strategy.choose(data)
-    selected = set(chosen)
-    if not selected or len(selected) != len(chosen) or not selected <= pool or len(selected) > n:
-        raise ValueError(f"{mode} returned invalid candidate IDs from {source}")
-    if len(selected) < n:
-        print(f"Selected all {len(selected)} eligible problems (requested {n})")
+    result = strategy.choose(data)
+    if isinstance(result, RoutedSelection):
+        if set(result.route_tags) != pool or not set(result.align_scores) <= pool:
+            raise ValueError("Routing must cover exactly the current candidate pool")
+        if any(tag not in ("retain", "both", "forget") for tag in result.route_tags.values()):
+            raise ValueError("Invalid route_tag")
+        if any(not math.isfinite(score) for score in result.align_scores.values()):
+            raise ValueError("Invalid align_score")
+        selected = pool
+    else:
+        selected = set(result)
+        if not selected or len(selected) != len(result) or not selected <= pool or len(selected) > n:
+            raise ValueError(f"{mode} returned invalid candidate IDs from {source}")
+        if len(selected) < n:
+            print(f"Selected all {len(selected)} eligible problems (requested {n})")
 
     with source.open(encoding="utf-8") as f:
         rows = [row for row in map(json.loads, f) if row["extra_info"]["index"] in selected]
+    if isinstance(result, RoutedSelection):
+        for row in rows:
+            gid = row["extra_info"]["index"]
+            row["route_tag"] = result.route_tags[gid]
+            row["align_score"] = float(result.align_scores[gid]) if gid in result.align_scores else None
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     with (out / "train.jsonl").open("w", encoding="utf-8") as f:
         for row in rows:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
-    hfds.Dataset.from_list(rows).to_parquet(str(out / "train.parquet"))
+    dataset = hfds.Dataset.from_list(rows)
+    if isinstance(result, RoutedSelection):
+        dataset = dataset.cast_column("align_score", hfds.Value("float64"))
+    dataset.to_parquet(str(out / "train.parquet"))
     return selected
 
 

@@ -42,6 +42,24 @@ def test_standalone_random_requires_chunk_and_honors_candidate_window(tmp_path, 
     assert read_ids(out) == [101, 123]
 
 
+def test_selector_can_annotate_an_entire_chunk_for_a_future_route_consumer(tmp_path, monkeypatch):
+    import pyarrow.parquet as pq
+
+    pool = write_dataset(tmp_path, "candidates", [101, 109, 103])
+    out = tmp_path / "selected"
+    route = select_data.RoutedSelection({101: "retain", 109: "both", 103: "forget"}, {101: 0.75, 103: -0.5})
+    monkeypatch.setitem(select_data.SELECTOR_REGISTRY, "test_route", select_data.Selector(lambda data: route))
+    select_data.select_from_chunk("test_route", pool, None, 1, out)
+    table = pq.read_table(out / "train.parquet")
+    assert len(table) == 3
+    assert table.column("route_tag").to_pylist() == ["retain", "both", "forget"]
+    assert table.column("align_score").to_pylist() == [0.75, None, -0.5]
+    assert str(table.schema.field("align_score").type) == "double"
+    route.route_tags.pop(103)
+    with pytest.raises(ValueError, match="exactly the current candidate pool"):
+        select_data.select_from_chunk("test_route", pool, None, 1, out)
+
+
 @pytest.fixture
 def experiment(tmp_path, monkeypatch):
     monkeypatch.setattr(datasets.config, "HF_DATASETS_CACHE", tmp_path / "hf-cache")
