@@ -1,0 +1,6 @@
+[submodule "graft/harbor"]
+	path = graft/sft/third_party/harbor
+	url = https://github.com/harbor-framework/harbor.git
+[submodule "graft/terminal-wrench"]
+	path = graft/sft/third_party/terminal-wrench
+	url = https://github.com/few-sh/terminal-wrench.git
