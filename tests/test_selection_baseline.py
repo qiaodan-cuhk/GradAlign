@@ -221,3 +221,18 @@ def test_online_similarity_reuses_per_question_scores_on_retry(experiment, monke
     dynamic_selection.main()
     assert seen.count("run_inference_local.py") == 2
     assert seen.count("run_parallel_analysis.py") == 1
+
+
+@pytest.mark.parametrize("rollouts,world", [(4, 8), (16, 8), (3, 2)])
+def test_shards_run_identical_collectives_without_reusing_real_answers(rollouts, world):
+    import runpy
+    shard_fn = runpy.run_path(str(Path(__file__).resolve().parents[1] / "select/parallel/group_shards.py"))["split_by_problem"]
+    rows = [{"group_id": gid, "global_index": gid * rollouts + sample,
+             "input_ids": [1, 2, 3], "attention_mask": [1, 1, 1], "response_mask": [0, 1]}
+            for gid in range(3) for sample in range(rollouts)]
+    shards = shard_fn(rows, world)
+    order = [row["group_id"] for row in shards[0]]
+    assert all([row["group_id"] for row in shard] == order for shard in shards)
+    actual = [row for shard in shards for row in shard]
+    assert sorted(row["global_index"] for row in actual if row["global_index"] >= 0) == list(range(len(rows)))
+    assert all(not any(row["response_mask"]) for row in actual if row["global_index"] < 0)

@@ -46,7 +46,7 @@ def collate_batch(batch: List[Dict[str, torch.Tensor]], pad_token_id: int = 0) -
                 # print("Pad length: ", pad_length, key)
                 if pad_length > 0:
                     if key in ['input_ids', 'attention_mask']:
-                        padded = F.pad(tensor, (0, pad_length), value=pad_token_id)
+                        padded = F.pad(tensor, (0, pad_length), value=pad_token_id if key == "input_ids" else 0)
                     else:
                         if pad_length > 1:
                             padded = F.pad(tensor, (0, pad_length - 1), value=0)

@@ -114,7 +114,8 @@ def compute_policy_loss(
     # if accelerator.is_main_process:
         # print('Advantages', advantages[0, 0])
     # print('fafa', masked_loss.sum() / response_mask.sum())
-    return masked_loss.sum() / response_mask.sum()
+    # Padding-only ranks participate in backward with zero contribution.
+    return masked_loss.sum() / response_mask.sum().clamp_min(1)
 
 
 def compute_kl_loss(

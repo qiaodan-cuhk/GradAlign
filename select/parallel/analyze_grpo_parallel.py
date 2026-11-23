@@ -109,6 +109,7 @@ def load_dataset_responses(
     accelerator: Accelerator,
     ground_truth_map: Optional[Dict[int, Any]] = None,
     max_num_samples: Optional[int] = None,
+    source_positions: Optional[dict] = None,
 ) -> Tuple[List[Any], List[str], List[int], List[str], List[bool]]:
     """Load responses for a specific dataset (train or val)."""
     responses_file = os.path.join(responses_dir, f'responses_sorted.json')
@@ -129,7 +130,7 @@ def load_dataset_responses(
     
     skipped_count = 0
     iterable = responses_data if max_num_samples is None else responses_data[:max_num_samples]
-    for item in iterable:
+    for source_index, item in enumerate(iterable):
         group_id = item['group_id']
         
         # Skip items with missing ground truth (e.g., problems removed by flip_label.py)
@@ -137,6 +138,8 @@ def load_dataset_responses(
             skipped_count += 1
             continue
         
+        if source_positions is not None:
+            source_positions[source_index] = len(prompts)
         prompts.append(item['prompt'])
         responses.append(item['response'])
         group_indices.append(group_id)
@@ -188,7 +191,7 @@ def main():
                        help="Maximum number of samples to load from each dataset")
     parser.add_argument("--problem_set_path", type=str, required=True,
                        help="Path to the problem set file (train.jsonl) containing ground truth")
-    parser.add_argument("--norm_before_accumlation", type=bool, default=False,
+    parser.add_argument("--norm_before_accumlation", action="store_true",
                        help="Normalize the gradients before accumulation")
     parser.add_argument("--use_optimizer", action="store_true", default=False,
                        help="Scale validation gradients with optimizer exp_avg_sq state")
@@ -262,6 +265,7 @@ def main():
     if accelerator.is_main_process:
         print(f"\nLoading training responses from: {args.train_responses_dir}")
     
+    train_positions = {}
     (
         train_prompts,
         train_responses,
@@ -269,7 +273,8 @@ def main():
         train_expected_answers,
         train_passed,
     ) = load_dataset_responses(
-        args.train_responses_dir, "train", accelerator, ground_truth_map, max_num_samples=args.max_num_samples
+        args.train_responses_dir, "train", accelerator, ground_truth_map, max_num_samples=args.max_num_samples,
+        source_positions=train_positions,
     )
     # Preserve full copies for advantage computation after sharding
     train_prompts_full = list(train_prompts)
@@ -368,9 +373,9 @@ def main():
             n = len(gid_list)
             shard = [
                 {
-                    'input_ids': torch.from_numpy(ids_obj[i]).to(dtype=torch.long),
-                    'attention_mask': torch.from_numpy(att_obj[i]).to(dtype=torch.long),
-                    'response_mask': torch.from_numpy(rsp_obj[i]).to(dtype=torch.long),
+                    'input_ids': torch.as_tensor(np.asarray(ids_obj[i], dtype=np.int64)),
+                    'attention_mask': torch.as_tensor(np.asarray(att_obj[i], dtype=np.int64)),
+                    'response_mask': torch.as_tensor(np.asarray(rsp_obj[i], dtype=np.int64)),
                     'group_id': int(gid_list[i]),
                     'global_index': int(gidx_list[i]),
                 }
@@ -384,8 +389,8 @@ def main():
     rank = accelerator.process_index
     world_size = accelerator.num_processes
 
-    train_data = load_shard(args.train_responses_dir, world_size, rank)[:args.max_num_samples // world_size]
-    val_data = load_shard(args.val_responses_dir, world_size, rank)[:args.max_num_samples // world_size]
+    train_data = load_shard(args.train_responses_dir, world_size, rank)
+    val_data = load_shard(args.val_responses_dir, world_size, rank)
 
     # Compute advantages on full datasets and attach by global_index
     train_advantages_full = compute_grpo_advantages(
@@ -401,17 +406,15 @@ def main():
     # print('Len', len(train_data))
     # print('fa' + str([(entry['global_index'], entry['group_id']) for entry in train_data]))
 
+    allowed_groups = set(train_group_indices_full)
+    train_data = [entry for entry in train_data if entry["group_id"] in allowed_groups]
+    zero = torch.tensor(0.0)
     for entry in train_data:
-        gi = entry.get('global_index', None)
-        if gi is None:
-            raise RuntimeError("Shard entry missing global_index for advantage mapping (train)")
-        entry['advantages'] = train_advantages_full[gi]
-
+        gi = entry["global_index"]
+        entry["advantages"] = zero if gi == -1 else train_advantages_full[train_positions[gi]]
     for entry in val_data:
-        gi = entry.get('global_index', None)
-        if gi is None:
-            raise RuntimeError("Shard entry missing global_index for advantage mapping (val)")
-        entry['advantages'] = val_advantages_full[gi]
+        gi = entry["global_index"]
+        entry["advantages"] = zero if gi == -1 else val_advantages_full[gi]
 
     if accelerator.is_main_process:
         print(f"Loaded train shard with {len(train_data)} entries; val shard with {len(val_data)} entries")

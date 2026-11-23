@@ -452,10 +452,8 @@ class GRPOGradientAnalyzerParallel:
             # Compute new log probabilities
             new_log_probs = compute_log_probs(
                 self.model, input_ids, attention_mask, response_mask
-            )[..., 1:]
-            
-            # Adjust tensors for shifted sequences
-            response_mask = response_mask[..., 1:]
+            )
+            # Both tensors already refer to next-token prediction targets.
             old_log_probs = new_log_probs.detach()
             
             # Broadcast advantages to token level
@@ -468,7 +466,7 @@ class GRPOGradientAnalyzerParallel:
             )
             
             # Total loss for this batch (don't scale by num_processes here since we want to aggregate)
-            batch_loss = policy_loss * 8
+            batch_loss = policy_loss * self.accelerator.num_processes
             
             # Accumulate loss
             total_loss += batch_loss.item()
@@ -733,16 +731,9 @@ class GRPOGradientAnalyzerParallel:
                 print(f"\nProcessing group {group_id} ({len(group_data)} samples) on all GPUs...")
             
             # All GPUs participate in computing gradients for this group
-            zero_advantage = True
-            for x in group_data:
-                # print(x)
-                # print(x['advantages'])
-                # print(str(self.accelerator.process_index) + " " + str(x['advantages']) + ' ' + str(x['group_id']) + '' + str(x['input_ids'].shape))
-                if abs(x['advantages'].item()) >= 1e-6:
-                    zero_advantage = False
-            # if self.accelerator.is_main_process:
-            # print(str(self.accelerator.process_index) + " " + str(zero_advantage))
-            if zero_advantage:# and False:
+            has_advantage = any(abs(row["advantages"].item()) >= 1e-6 for row in group_data)
+            active = torch.tensor(int(has_advantage), device=self.accelerator.device)
+            if self.accelerator.reduce(active, reduction="sum").item() == 0:
                 if self.accelerator.is_main_process:
                     print(f"Skipping group {group_id} because all advantages are 0")
                 group_loss = 0.0

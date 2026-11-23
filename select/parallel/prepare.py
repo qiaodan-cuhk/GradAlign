@@ -24,6 +24,7 @@ from transformers import AutoTokenizer
 
 # Local utilities
 from grpo_utils import create_response_mask
+from group_shards import split_by_problem
 
 
 def read_jsonl_or_json_list(responses_dir: str) -> Tuple[List[Dict], str]:
@@ -31,6 +32,9 @@ def read_jsonl_or_json_list(responses_dir: str) -> Tuple[List[Dict], str]:
     jsonl_alt = os.path.join(responses_dir, 'responses_sorted.jsonl')
     json_list = os.path.join(responses_dir, 'responses_sorted.json')
 
+    if os.path.exists(json_list):
+        with open(json_list) as f:
+            return json.load(f), json_list
     if os.path.exists(jsonl_path):
         path = jsonl_path
         with open(path, 'r') as f:
@@ -41,12 +45,6 @@ def read_jsonl_or_json_list(responses_dir: str) -> Tuple[List[Dict], str]:
         with open(path, 'r') as f:
             records = [json.loads(line) for line in f if line.strip()]
         return records, path
-    if os.path.exists(json_list):
-        path = json_list
-        with open(path, 'r') as f:
-            records = json.load(f)
-        return records, path
-
     raise FileNotFoundError(
         f"Could not find response_sorted.jsonl/responses_sorted.jsonl/responses_sorted.json in {responses_dir}"
     )
@@ -105,6 +103,7 @@ def main():
     parser.add_argument('--world_size', type=int, required=True, help='Number of ranks to split into')
     parser.add_argument('--max_length', type=int, default=1024, help='Maximum sequence length')
     parser.add_argument('--num_workers', type=int, default=128, help='Number of worker threads for tokenization')
+    parser.add_argument('--max_num_samples', type=int)
     parser.add_argument('--output_prefix', type=str, default='data_', help='Prefix for split files (data_{rank}.pt or .npz)')
     parser.add_argument('--save_format', type=str, default='npz', choices=['pt','npz'], help='Output format for shards')
 
@@ -112,6 +111,7 @@ def main():
 
     os.makedirs(args.responses_dir, exist_ok=True)
     records, src_path = read_jsonl_or_json_list(args.responses_dir)
+    records = records[:args.max_num_samples]
     print(f"Loaded {len(records)} records from {src_path}")
 
     # Parallel tokenization using processes (one tokenizer per process)
@@ -122,16 +122,12 @@ def main():
         for entry in pool.imap_unordered(tokenize_record, enumerate(records), chunksize=64):
             entries.append(entry)
 
-    print(f"Tokenized {len(entries)} entries. Sorting...")
-    entries.sort(key=lambda e: (int(e['group_id']), seq_len(e)))
-
-    # Split into world_size shards by modulo position in sorted array
-    print(f"Splitting into {args.world_size} shards and saving...")
+    shards = split_by_problem(entries, args.world_size)
     out_dir = os.path.join(args.responses_dir, 'data')
     os.makedirs(out_dir, exist_ok=True)
 
     def build_and_save(rank: int):
-        shard = [e for i, e in enumerate(entries) if (i % args.world_size) == rank]
+        shard = shards[rank]
         if args.save_format == 'pt':
             tensor_shard = []
             for e in shard:

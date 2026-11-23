@@ -9,6 +9,8 @@ import subprocess
 import sys
 import os
 import tempfile
+import json
+from pathlib import Path
 
 
 def create_accelerate_config(num_gpus: int = 8, mixed_precision: str = "bf16"):
@@ -93,40 +95,28 @@ def main():
     if args.use_optimizer and not args.optimizer_state_path:
         parser.error("--optimizer_state_path must be provided when --use_optimizer is set")
 
-    # Auto-run CPU tokenization (prepare.py) if shards are missing
-    def _shards_exist(responses_dir: str, world_size: int, prefix: str = "data_") -> bool:
-        try:
-            data_dir = os.path.join(responses_dir, 'data')
-            print('fafa', os.path.exists(os.path.join(data_dir, f"{prefix}{0}.npz")))
-            return all(os.path.exists(os.path.join(data_dir, f"{prefix}{r}.npz")) for r in range(world_size))
-        except Exception:
-            return False
-
-    def _run_prepare(responses_dir: str, model_path: str, world_size: int, max_length: int, num_workers: int = 128):
-        prepare_path = os.path.join(os.path.dirname(__file__), 'prepare.py')
-        cmd = [
-            sys.executable, prepare_path,
-            '--responses_dir', responses_dir,
-            '--model_path', model_path,
-            '--world_size', str(world_size),
-            '--max_length', str(max_length),
-            '--num_workers', str(num_workers),
-        ]
-        print(f"Preparing dataset at {responses_dir} (world_size={world_size}, max_length={max_length}, workers={num_workers})")
-        print(' '.join(cmd))
+    for directory in dict.fromkeys([args.train_responses_dir, args.val_responses_dir]):
+        folder = Path(directory)
+        stat = (folder / "responses_sorted.json").stat()
+        manifest = folder / "data" / "shards.json"
+        expected = {"version": 2, "world_size": args.num_gpus, "model": args.model_path,
+                    "max_length": args.max_length, "max_num_samples": args.max_num_samples,
+                    "responses": [stat.st_size, stat.st_mtime_ns]}
+        if (manifest.exists() and json.loads(manifest.read_text()) == expected
+                and all((manifest.parent / f"data_{rank}.npz").is_file() for rank in range(args.num_gpus))):
+            continue
+        # Only publish the version marker after all ranks' files have been written.
+        manifest.unlink(missing_ok=True)
+        cmd = [sys.executable, str(Path(__file__).with_name("prepare.py")),
+               "--responses_dir", directory, "--model_path", args.model_path,
+               "--world_size", str(args.num_gpus), "--max_length", str(args.max_length)]
+        if args.max_num_samples is not None:
+            cmd.extend(["--max_num_samples", str(args.max_num_samples)])
         subprocess.run(cmd, check=True)
+        tmp = manifest.with_suffix(".tmp")
+        tmp.write_text(json.dumps(expected))
+        tmp.replace(manifest)
 
-    # Ensure shards for both train and val
-    if not _shards_exist(args.train_responses_dir, args.num_gpus):
-        _run_prepare(args.train_responses_dir, args.model_path, args.num_gpus, args.max_length, 128)
-    else:
-        print(f"Train shards already present under {args.train_responses_dir}; skipping prepare")
-
-    if not _shards_exist(args.val_responses_dir, args.num_gpus):
-        _run_prepare(args.val_responses_dir, args.model_path, args.num_gpus, args.max_length, 128)
-    else:
-        print(f"Val shards already present under {args.val_responses_dir}; skipping prepare")
-    
     # Create accelerate config if not provided
     if args.config_file is None:
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", prefix="gradalign-", delete=False) as config:
@@ -151,11 +141,13 @@ def main():
         "--max_length", str(args.max_length),
         "--mixed_precision", args.mixed_precision,
         "--fsdp_auto_wrap_policy", args.fsdp_auto_wrap_policy,
-        "--max_num_samples", str(args.max_num_samples),
         "--problem_set_path", args.problem_set_path,
         "--mode", args.mode,
     ]
     
+    if args.max_num_samples is not None:
+        launch_cmd.extend(["--max_num_samples", str(args.max_num_samples)])
+
     # Add optional flags
     if args.norm_before_accumlation:
         launch_cmd.append("--norm_before_accumlation")
