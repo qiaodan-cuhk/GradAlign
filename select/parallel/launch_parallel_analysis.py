@@ -8,6 +8,7 @@ import argparse
 import subprocess
 import sys
 import os
+import tempfile
 
 
 def create_accelerate_config(num_gpus: int = 8, mixed_precision: str = "bf16"):
@@ -128,11 +129,9 @@ def main():
     
     # Create accelerate config if not provided
     if args.config_file is None:
-        config_content = create_accelerate_config(args.num_gpus, args.mixed_precision)
-        config_file = "accelerate_config.yaml"
-        with open(config_file, 'w') as f:
-            f.write(config_content)
-        print(f"Created accelerate config: {config_file}")
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", prefix="gradalign-", delete=False) as config:
+            config.write(create_accelerate_config(args.num_gpus, args.mixed_precision))
+            config_file = config.name
     else:
         config_file = args.config_file
     
@@ -140,7 +139,8 @@ def main():
     launch_cmd = [
         "accelerate", "launch",
         "--config_file", config_file,
-        "analyze_grpo_parallel.py",
+        *(["--main_process_port", "0"] if args.config_file is None else []),
+        os.path.join(os.path.dirname(__file__), "analyze_grpo_parallel.py"),
         "--model_path", args.model_path,
         "--train_responses_dir", args.train_responses_dir,
         "--val_responses_dir", args.val_responses_dir,
@@ -178,7 +178,7 @@ def main():
     
     # Run the command
     try:
-        result = subprocess.run(launch_cmd, check=True)
+        subprocess.run(launch_cmd, check=True)
         print("="*80)
         print("Parallel analysis completed successfully!")
     except subprocess.CalledProcessError as e:

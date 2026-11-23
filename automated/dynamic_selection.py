@@ -6,7 +6,6 @@ import argparse
 import subprocess
 import sys
 from typing import List, Tuple
-import time
 
 import datasets as hfds  # type: ignore[import-not-found]
 
@@ -94,25 +93,6 @@ def chunk_dataset(train_dir: str, exp_root: str, train_parquet: str, chunk_size:
     with open(os.path.join(exp_root, "manifest.json"), "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False, indent=2)
     return num_chunks, chunk_dirs
-
-
-def _kill_other_pythons() -> None:
-    """Force-kill all other python processes except this one.
-
-    This is a blunt instrument intended to free GPUs/CPUs before heavy stages.
-    """
-    try:
-        # Use pkill to terminate python processes not matching this PID
-        # Avoid killing this script by filtering our own PID via shell pattern
-        my_pid = str(os.getpid())
-        # Build the awk with proper quoting to avoid f-string braces issues
-        awk_expr = f"$2~/(python|python3)/ && $1!={my_pid} {{print $1}}"
-        shell_cmd = f"ps -eo pid,comm,cmd | awk '{awk_expr}' | xargs -r -n1 -P1 kill -9"
-        cmd = ["bash", "-lc", shell_cmd]
-        subprocess.run(cmd, check=False)
-    except Exception:
-        # Best-effort; do not crash orchestrator
-        pass
 
 
 def _set_random_seed(seed: int) -> None:
@@ -257,8 +237,6 @@ def main():
         print(f"Auto-resume: resuming from iteration {i_start}")
 
     for i in range(i_start, args.num_selections):
-        # Hard kill stray python processes at the start of each iteration
-        _kill_other_pythons()
         chunk_idx = i % num_chunks
         chunk_dir = os.path.join(chunks_root, f"chunk_{chunk_idx}")
         prompts_file = os.path.join(chunk_dir, "train.jsonl")
@@ -333,7 +311,6 @@ def main():
             infer_cmd.append("--use_model_judge")
         # infer_cmd.extend(["--model_judge_concurrency", str(max(1, args.concurrency))])
 
-        _kill_other_pythons()
         # Skip train inference if responses already complete
         expected_train = chunk_sizes[chunk_idx] * args.n_samples_train
         train_part_dir = os.path.join(train_parts_root, "part_0")
@@ -389,8 +366,6 @@ def main():
             if args.reward_manager:
                 infer_val_cmd.append("--use_model_judge")
                 # infer_val_cmd.extend(["--model_judge_concurrency", str(max(1, args.concurrency))])
-            _kill_other_pythons()
-            time.sleep(10)
             # Skip val inference if responses already complete
             expected_val = val_lines * args.n_samples_val if val_lines > 0 else 0
             val_resp_json = os.path.join(val_dir_override, "responses.json")
@@ -419,8 +394,6 @@ def main():
                 subprocess.run(infer_val_cmd, check=True)
 
         # 3) Analysis and aggregation (for sim/simacc)
-        _kill_other_pythons()
-        time.sleep(5)
         if args.mode in {"sim", "simacc", "align", "negsim", 'norm', 'dot'}:
             if args.mode == 'align' or args.mode == 'norm':
                 args.val_dataset = args.train_dataset
@@ -454,9 +427,6 @@ def main():
                 print("Executing:", " ".join(ana_cmd))
                 subprocess.run(ana_cmd, check=True)
 
-        # After inference and analysis, aggressively clean up other python processes
-        _kill_other_pythons()
-        time.sleep(10)
 
         # Aggregate accuracy and copy similarity
         if args.mode in {"sim", "simacc", "acc", "accgreedy", 'align', 'negsim', 'norm', 'dot'}:
@@ -489,8 +459,6 @@ def main():
             sel_cmd.extend(["--acc_low", str(args.acc_low), "--acc_high", str(args.acc_high)])
         print("Executing:", " ".join(sel_cmd))
         subprocess.run(sel_cmd, check=True)
-        _kill_other_pythons()
-        time.sleep(10)
 
         # 5) Launch training with selected set, fixed experiment name
         os.system(f"rm {step_root}/data.pt")
@@ -514,8 +482,6 @@ def main():
             
         print("Executing:", " ".join(train_cmd))
         subprocess.run(train_cmd, check=True)
-        _kill_other_pythons()
-        time.sleep(10)
 
 
 if __name__ == "__main__":
