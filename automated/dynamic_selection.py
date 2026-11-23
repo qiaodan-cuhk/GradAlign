@@ -19,7 +19,8 @@ from experiment import describe_datasets, record_experiment, run_lock
 from checkpoints import TRACKER, atomic_text, hf_weights_ready, latest_complete, mark_complete, resume_arguments
 from select_data import SELECTOR_REGISTRY
 from timing import measure_stage
-from launch_verl_training import DEFAULT_CHECKPOINT_ROOT, DEFAULT_ROLLOUT_N, build_exp_name
+from launch_verl_training import (DEFAULT_CHECKPOINT_ROOT, DEFAULT_ROLLOUT_N, DEFAULT_HELDOUT_ROLLOUT_N,
+                                  DEFAULT_TEST_FREQ, build_exp_name)
 
 
 def _load_train_dataset(train_dir: str, train_parquet: str):
@@ -140,6 +141,8 @@ def main():
                         help="Number of training iterations per selection (compute top N = batch_size * iters_per_select)")
 
     parser.add_argument("--rollout_n", type=int, default=DEFAULT_ROLLOUT_N, help="Fresh GRPO training answers per selected prompt")
+    parser.add_argument("--rollout_val_n", type=int, default=DEFAULT_HELDOUT_ROLLOUT_N, help="Answers per held-out prompt")
+    parser.add_argument("--test_freq", type=int, default=DEFAULT_TEST_FREQ, help="Held-out evaluation frequency in GRPO steps")
 
     # Inference controls
     parser.add_argument("--analysis_gpus", type=int, default=8)
@@ -169,8 +172,8 @@ def main():
 
     args = parse_experiment_args(parser)
     strategy = SELECTOR_REGISTRY[args.mode]
-    if args.rollout_n < 1:
-        parser.error("--rollout_n must be positive")
+    if min(args.rollout_n, args.rollout_val_n) < 1:
+        parser.error("Training and held-out rollout counts must be positive")
     if args.allocated_gpus is not None and args.allocated_gpus < 0:
         parser.error("--allocated_gpus must be nonnegative")
     args.ckpt_root = os.path.abspath(os.path.expanduser(args.ckpt_root))
@@ -386,6 +389,9 @@ def run_rounds(args, strategy, exp_name, train_dir, val_dir, heldout_dir):
             "--total_training_steps", str(end_step),
             "--exp_name", exp_name,
             "--rollout_n", str(args.rollout_n),
+            "--rollout_val_n", str(args.rollout_val_n),
+            "--test_freq", str(args.test_freq),
+            "--val_before_train" if resume_step == 0 else "--no-val_before_train",
             "--ckpts_root", args.ckpt_root,
             "--backend", args.merge_backend,
             '--train_batch_size', str(args.train_batch_size),

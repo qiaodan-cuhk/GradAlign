@@ -15,6 +15,8 @@ from timing import measure_stage
 
 DEFAULT_CHECKPOINT_ROOT = "~/data_selection/data/chkpt"
 DEFAULT_ROLLOUT_N = 32
+DEFAULT_HELDOUT_ROLLOUT_N = 16
+DEFAULT_TEST_FREQ = 5
 VERL_PACKAGE = Path(__file__).resolve().parents[1] / "verl" / "verl"
 
 
@@ -60,7 +62,7 @@ def main():
     parser.add_argument("--rollout_n", type=int, default=DEFAULT_ROLLOUT_N)
     parser.add_argument("--rollout_val_do_sample", action="store_true", default=True)
     parser.add_argument("--rollout_val_temperature", type=float, default=0.7)
-    parser.add_argument("--rollout_val_n", type=int, default=16)
+    parser.add_argument("--rollout_val_n", type=int, default=DEFAULT_HELDOUT_ROLLOUT_N)
     parser.add_argument("--rollout_max_num_batched_tokens", type=int, default=163840)
 
     # Parallelism/offload controls
@@ -78,7 +80,9 @@ def main():
     parser.add_argument("--allocated_gpus", type=int, help="Dedicated GPU allocation for the wall-time cost ledger")
     parser.add_argument("--nnodes", type=int, default=1)
     parser.add_argument("--save_freq", type=int, default=2)
-    parser.add_argument("--test_freq", type=int, default=5)
+    parser.add_argument("--test_freq", type=int, default=DEFAULT_TEST_FREQ)
+    parser.add_argument("--val_before_train", action=argparse.BooleanOptionalAction, default=None,
+                        help="Evaluate the held-out set before the first update of this launch")
     parser.add_argument("--total_epochs", type=int, default=1500)
     parser.add_argument("--resume_mode", type=str, default="auto")
     parser.add_argument("--resume_from_path", help="Exact verified global_step checkpoint to restore")
@@ -96,8 +100,8 @@ def main():
     parser.add_argument("--reward_manager", default="naive", type=str)
 
     args = parser.parse_args()
-    if args.rollout_n < 1:
-        parser.error("--rollout_n must be positive")
+    if min(args.rollout_n, args.rollout_val_n) < 1:
+        parser.error("Training and held-out rollout counts must be positive")
     if args.allocated_gpus is not None and args.allocated_gpus < 0:
         parser.error("--allocated_gpus must be nonnegative")
 
@@ -121,7 +125,8 @@ def main():
     roles = describe_datasets((args.train_dataset, train_file), None, (args.heldout_eval, val_file))
     atomic_text(Path(ckpts_dir) / "training_inputs.json", json.dumps({
         "datasets": roles, "rollout_n": args.rollout_n, "train_batch_size": args.train_batch_size,
-        "target_step": args.total_training_steps,
+        "target_step": args.total_training_steps, "rollout_val_n": args.rollout_val_n,
+        "test_freq": args.test_freq, "val_before_train": args.val_before_train,
     }, indent=2) + "\n")
 
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
@@ -232,6 +237,8 @@ def main():
         cmd.extend(["trainer.resume_mode=resume_path", f"trainer.resume_from_path={args.resume_from_path}"])
     if args.total_training_steps is not None:
         cmd.append(f"trainer.total_training_steps={args.total_training_steps}")
+    if args.val_before_train is not None:
+        cmd.append(f"trainer.val_before_train={str(args.val_before_train).lower()}")
 
     print("Executing:\n" + " \\n+    \n".join(cmd))
     with measure_stage(ckpts_dir, "grpo_and_heldout", args.allocated_gpus, target_step=args.total_training_steps):

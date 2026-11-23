@@ -144,13 +144,15 @@ def test_trainer_receives_heldout_rollouts_and_absolute_checkpoint_root(experime
     argv = ["launch_verl_training", "--prefix", "test", "--model", "toy", "--model_path", "local-model",
             "--train_dataset", "train", "--heldout_eval", "heldout", "--backend", backend,
             "--ckpts_root", str(root), "--exp_name", "run", "--total_training_steps", "20",
-            "--rollout_n", "16", "--resume_from_path", str(resume), "--allocated_gpus", "2"]
+            "--rollout_n", "16", "--resume_from_path", str(resume), "--allocated_gpus", "2",
+            "--rollout_val_n", "7", "--test_freq", "3", "--no-val_before_train"]
     seen = []
     monkeypatch.setattr(sys, "argv", argv)
     monkeypatch.setattr(training.subprocess, "run", lambda cmd, check: seen.append(cmd))
     training.main()
     command, = seen
     expected = {"actor_rollout_ref.rollout.n=16", f"trainer.default_local_dir={root}/run",
+                "actor_rollout_ref.rollout.val_kwargs.n=7", "trainer.test_freq=3", "trainer.val_before_train=false",
                 f"data.train_files={tmp_path}/train/train.parquet", f"data.val_files={tmp_path}/heldout/train.parquet",
                 "trainer.total_training_steps=20", "trainer.resume_mode=resume_path",
                 f"trainer.resume_from_path={resume}"}
@@ -233,9 +235,11 @@ def test_interrupted_round_restores_its_sampler_then_switches_chunks(experiment,
         attempts.append(target)
         if len(attempts) == 1:
             assert option("--resume_mode") == "disable"
+            assert "--val_before_train" in cmd
             fake_checkpoint(root, 1)
             raise InterruptedError
         resume = Path(option("--resume_from_path"))
+        assert "--no-val_before_train" in cmd
         if target == 2:
             assert resume == root / "global_step_1"
             assert (resume / "data.pt").is_file()
