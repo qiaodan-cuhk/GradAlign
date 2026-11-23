@@ -125,7 +125,7 @@ def main():
     parser.add_argument("--chunk_size", required=True, type=int,
                         help="Number of items per chunk")
     parser.add_argument("--k", required=True, type=int,
-                        help="Number of items per chunk")
+                        help="Selection divisor, e.g. k=20 selects up to one twentieth of the eligible candidates")
     parser.add_argument("--seed", default=42, type=int)
 
     # Selection controls
@@ -133,13 +133,13 @@ def main():
     parser.add_argument("--acc_low", type=float, default=0.2)
     parser.add_argument("--acc_high", type=float, default=0.8)
     parser.add_argument("--epochs_per_select", type=int, default=1,
-                        help="Train epochs per selection iteration (we run 1 epoch per launch; this controls total iterations with total_epochs)")
+                        help="Legacy compatibility option (ignored). Set --iters_per_select for the round budget.")
     parser.add_argument("--num_selections", type=int, required=True,
                         help="Number of selection iterations to run")
     parser.add_argument("--train_batch_size", type=int, required=True,
-                        help="Train batch size used to determine selection size")
+                        help="Prompts per GRPO step, before generating training rollouts")
     parser.add_argument("--iters_per_select", type=int, required=True,
-                        help="Number of training iterations per selection (compute top N = batch_size * iters_per_select)")
+                        help="Number of GRPO steps on each selected Parquet")
 
     parser.add_argument("--rollout_n", type=int, default=DEFAULT_ROLLOUT_N, help="Fresh GRPO training answers per selected prompt")
     parser.add_argument("--rollout_val_n", type=int, default=DEFAULT_HELDOUT_ROLLOUT_N, help="Answers per held-out prompt")
@@ -173,6 +173,8 @@ def main():
 
     args = parse_experiment_args(parser)
     strategy = SELECTOR_REGISTRY[args.mode]
+    if args.epochs_per_select != 1:
+        print("--epochs_per_select is ignored; --iters_per_select sets the GRPO step budget.", file=sys.stderr)
     if min(args.rollout_n, args.rollout_val_n) < 1:
         parser.error("Training and held-out rollout counts must be positive")
     if args.allocated_gpus is not None and args.allocated_gpus < 0:
