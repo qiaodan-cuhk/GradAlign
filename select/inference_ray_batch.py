@@ -26,7 +26,7 @@ from ray.data.llm import build_llm_processor, vLLMEngineProcessorConfig
 
 # Add parent directory to path to import utils
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from utils import compare_answers, extract_answer
+from utils import extract_answer, math_response_passed
 from verl.utils.reward_score.model_reward import compute_score  # type: ignore[import-not-found]
 
 # Check Ray version
@@ -235,7 +235,7 @@ def postprocess_from_vllm(row: Dict[str, Any]) -> Dict[str, Any]:
     
     # Check if answer is correct using utility function (rule-based)
     expected = str(row.get("expected_answer", "")).strip()
-    passed = compare_answers(extracted_answer, expected)
+    passed = math_response_passed(response, expected)
     
     return {
         "data_source": row["data_source"],
@@ -462,7 +462,7 @@ def main():
     if args.use_model_judge:
         print("\nRunning model judge fallback on unmatched responses...")
         # updated = run_model_judge(results, args.model_judge_concurrency)
-        updated = run_model_judge(results, 4096)
+        updated = run_model_judge(results, args.model_judge_concurrency)
         print(f"Model judge marked {updated} additional responses as passed.")
 
     # Calculate accuracy

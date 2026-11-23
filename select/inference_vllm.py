@@ -18,7 +18,7 @@ from datetime import datetime
 
 # Add parent directory to path to import utils
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from utils import compare_answers, extract_answer
+from utils import extract_answer, math_response_passed
 
 
 def load_training_data(data_path: str, max_samples: int = 1000) -> List[Dict]:
@@ -278,7 +278,7 @@ def calculate_accuracy(responses_data: List[Dict]) -> Dict:
         extracted_answer = extract_answer_from_response(response)
         
         # Check if answer is correct using utility function
-        is_correct = compare_answers(extracted_answer, expected)
+        is_correct = math_response_passed(response, expected)
         
         # Store results
         item['extracted_answer'] = extracted_answer

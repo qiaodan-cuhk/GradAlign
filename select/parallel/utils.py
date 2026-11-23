@@ -1,5 +1,7 @@
 import re
 from typing import Optional
+
+from verl.utils.reward_score.math_reward import compute_score, is_equiv
 # from sympy.parsing.latex import parse_latex
 # import sympy as sp
 
@@ -68,42 +70,15 @@ def extract_answer(response: str) -> Optional[str]:
     
     return None
 
+def math_response_passed(response: str, expected: str) -> bool:
+    """Grade the full generated solution using the GRPO math reward."""
+    return bool(compute_score(response, expected))
+
+
 def compare_answers(model_answer: str, true_answer: str) -> bool:
-    """
-    Compare answers using symbolic mathematics with SymPy
-    """
-    if model_answer is None or true_answer is None:
-        return False
-    
-    try:
-        # 1. Strip delimiters
-        model_tex = str(model_answer).strip('$ ')
-        true_tex = str(true_answer).strip('$ ')
-        
-        # Handle empty answers
-        if not model_tex or not true_tex:
-            return model_tex == true_tex
-        
-        # 2. Parse with SymPy
-        # try:
-        #     model_expr = parse_latex(model_tex)
-        #     true_expr = parse_latex(true_tex)
-            
-        #     # 3. Symbolic check
-        #     if sp.simplify(model_expr - true_expr) == 0:
-        #         return True
-        #     else:
-        #         return False
-                
-        # except Exception as parse_error:
-        #     print(f"    ⚠️  LaTeX parsing failed: {parse_error}")
-            # Fallback to string comparison for non-LaTeX answers
-        return normalize_answer_fallback(model_answer) == normalize_answer_fallback(true_answer)
-            
-    except Exception as e:
-        print(f"    ⚠️  Answer comparison failed: {e}")
-        # Ultimate fallback to string comparison
-        return normalize_answer_fallback(model_answer) == normalize_answer_fallback(true_answer)
+    """Compatibility helper for callers that already extracted both answers."""
+    return model_answer is not None and true_answer is not None and is_equiv(model_answer, true_answer)
+
 
 def normalize_answer_fallback(answer: str) -> str:
     """

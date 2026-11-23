@@ -74,3 +74,17 @@ def test_random_uses_only_current_chunk(experiment, monkeypatch):
     dynamic_selection.main()
     assert seen == ["select_data.py", "launch_verl_training.py"] * 2
     assert selections[0] == selections[1]
+
+
+@pytest.mark.parametrize("answer, expected, correct", [
+    (r"work then \boxed{0.5}", r"\frac{1}{2}", True),
+    (r"\boxed{0.5} then \boxed{2}", r"\frac{1}{2}", False),
+    ("0.5", "0.5", False),
+])
+def test_math_grading_uses_complete_response(answer, expected, correct):
+    import runpy
+    selection_utils = runpy.run_path(str(Path(__file__).resolve().parents[1] / "select/utils.py"))
+    from verl.utils.reward_score.math_reward import compute_score
+
+    assert selection_utils["math_response_passed"](answer, expected) is correct
+    assert bool(compute_score(answer, expected)) is correct

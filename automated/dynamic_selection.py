@@ -170,6 +170,7 @@ def main():
     parser.add_argument("--val_infer_batch_size", type=int, default=512)
     parser.add_argument("--max_model_len", type=int, default=4096)
     parser.add_argument("--use_optimizer", action="store_true", default=False)
+    parser.add_argument("--use_model_judge", action="store_true", help="Use the model judge for selection rollouts")
     parser.add_argument("--reward_manager", type=str, default=None)
     parser.add_argument("--reward_path", type=str, default=None)
     
@@ -312,7 +313,7 @@ def main():
             "--max_model_len", str(args.max_model_len),
             "--concurrency", str(args.concurrency),
         ]
-        if args.reward_manager:
+        if args.use_model_judge or os.path.basename(args.reward_path or "") == "model_reward.py":
             infer_cmd.append("--use_model_judge")
         # infer_cmd.extend(["--model_judge_concurrency", str(max(1, args.concurrency))])
 
@@ -370,7 +371,7 @@ def main():
                 "--max_model_len", str(args.max_model_len),
                 "--concurrency", str(args.concurrency),
             ]
-            if args.reward_manager:
+            if args.use_model_judge or os.path.basename(args.reward_path or "") == "model_reward.py":
                 infer_val_cmd.append("--use_model_judge")
                 # infer_val_cmd.extend(["--model_judge_concurrency", str(max(1, args.concurrency))])
             # Skip val inference if responses already complete

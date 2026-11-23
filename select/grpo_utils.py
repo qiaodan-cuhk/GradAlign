@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 from typing import Dict, List, Tuple, Optional
 import re
-from utils import compare_answers, extract_answer
+from verl.utils.reward_score.math_reward import compute_score
 
 def check_model_for_nan(model):
     """Check if any model parameters contain NaN values."""
@@ -136,16 +136,8 @@ def math_reward_function(prompt: str, response: str, expected_answer: str = None
     """
     response = response.strip()
     
-    # Extract the predicted answer using utility function
-    predicted_answer = extract_answer(response)
-    
-    # If we have an expected answer, compare using utility function
-    # print('predicted_answer', predicted_answer, 'expected_answer', expected_answer)
-    if expected_answer and predicted_answer:
-        is_correct = compare_answers(predicted_answer, expected_answer)
-        return 1.0 if is_correct else 0.0
-    
-    return 0.0
+    return compute_score(response, expected_answer) if expected_answer is not None else 0.0
+
 
 def print_training_stats(losses: List[Dict[str, float]], epoch: int):
     """
