@@ -42,7 +42,7 @@ The method is designed for non-stationary LLM RL and targets three practical reg
 | GradAlign (dot) | `dot` | Dot product similarity |
 | LearnAlign | `align` | Gradient alignment without external validation set |
 | AccGreedy | `accgreedy` | Prioritize problems with pass rate closest to 50% |
-| Random | `rand` | Uniform random selection |
+| Random | `rand_in_chunk` (alias `rand`) | Sample actual IDs from the current chunk without replacement, using seed + round index. Skips rollout generation and gradient scoring. |
 
 ## 1) Environment setup
 
@@ -88,6 +88,18 @@ The runner checks normalized user prompts for holdout overlap and records the re
 `experiment.json`. Use a separate prefix for each method and seed. For legacy runs without a manifest,
 `--adopt_legacy_run` records the settings you supply after you verify the original run.
 The launcher resolves the bundled veRL configuration and reward paths relative to this checkout.
+
+From the repository root, run either arm of the 16-training-rollout example with the same YAML.
+Use the actual number of dedicated GPUs for the timing ledger.
+
+```bash
+python automated/dynamic_selection.py --config configs/webinstruct_math.yaml --allocated_gpus 8
+python automated/dynamic_selection.py --config configs/webinstruct_math.yaml --mode rand_in_chunk --prefix webinstruct_rand_s42 --allocated_gpus 8
+```
+
+To add a baseline, register its choice function and required signals in `automated/select_data.py`,
+then select it with `mode` in a new experiment YAML. The shared runner writes its selected Parquet
+and sends it to the same training launcher and held-out evaluation. See [REPO_CONTRACT.md](REPO_CONTRACT.md).
 
 ## 3) Data preparation
 
@@ -142,6 +154,7 @@ python dynamic_selection.py \
   --iters_per_select 10 \
   --n_samples_train 128 \
   --n_samples_val 16 \
+  --rollout_n 16 \
   --minibatch_size 8 \
   --max_tokens 3072 \
   --max_model_len 4096 \
@@ -157,8 +170,13 @@ Important arguments:
 - `--iters_per_select`: GRPO update steps between selection rounds.
 - `--num_selections`: number of selection rounds.
 
-Constraint enforced by code:
-- `(k * train_batch_size * iters_per_select) % chunk_size == 0`
+The round selects up to `floor(eligible candidate count / k)` prompts. The selected data must fill at
+least one training batch. The sample above selects 256 of 5,120 candidates and takes 10 GRPO steps of
+128 prompts each. With all selected prompts usable, that is five passes over those 256 prompts.
+Each training appearance generates 16 fresh answers. In this example, the 128 candidate answers per
+question are a separate expense. The YAML example uses 16 candidate answers per question.
+The source is shuffled once with the chunk seed, drops the incomplete tail when full chunks exist,
+and cycles through those chunks, so a question can be selected again on later visits.
 
 ## 5) Baselines
 
@@ -173,10 +191,12 @@ python dynamic_selection.py \
   --selection_reference amc22 \
   --chunk_size 5120 \
   --k 20 \
-  --mode rand \
+  --mode rand_in_chunk \
   --num_selections 100 \
   --train_batch_size 128 \
   --iters_per_select 10 \
+  --rollout_n 16 \
+  --max_tokens 3072 \
   --ckpt_root /path/to/checkpoints \
   --heldout_eval amc23
 ```
@@ -192,7 +212,9 @@ python launch_verl_training.py \
   --heldout_eval amc23 \
   --train_batch_size 128 \
   --max_response_length 3072 \
-  --total_epochs 1000
+  --rollout_n 16 --test_freq 5 --rollout_val_n 16 \
+  --total_training_steps 1000 --total_epochs 1000 \
+  --ckpt_root /path/to/checkpoints --allocated_gpus 8
 ```
 
 ## 6) Export merged model
@@ -218,13 +240,22 @@ python merge_model.py \
 Typical artifacts under `ckpt_root/<experiment_name>/`:
 - `chunks/chunk_*/train.jsonl` and `chunks/chunk_*/train.parquet`: chunked candidate pools.
 - `global_step_*/train_split/part_0/responses.json` and `responses_sorted.json`: train rollouts.
-- `global_step_*/train_split/part_0/similarity_results_cosine_real.jsonl`: per-response similarity (parallel analysis output).
+- `global_step_*/train_split/part_0/similarity_results_cosine_real.jsonl`: one score per candidate problem.
 - `global_step_*/train_split/similarity_results_aggregated.jsonl`: per-problem aggregated similarity.
 - `global_step_*/train_split/accuracy_by_problem.jsonl`: per-problem accuracy (and similarity when available).
 - `global_step_*/val_responses/responses.json` and `responses_sorted.json`: validation rollouts (for similarity-based modes).
-- `global_step_*/merged/`: merged model used by the next selection round (dynamic selection runs).
+- `global_step_*/merged/`: merged model when the actor checkpoint lacks a complete Hugging Face export.
 - `selected/iter_<i>_<mode>_<n>/train.jsonl` and `train.parquet`: selected training subset for that iteration.
 - `global_step_*/actor/` (from VERL): training checkpoint shards used as merge input.
+- `global_step_*/gradalign_complete.json` records a verified round boundary.
+- `timings.jsonl` records chunk preparation, selection (including candidate and reference work),
+  and GRPO with held-out evaluation. GPU-hours equal wall seconds times the declared dedicated GPU count
+  divided by 3,600. The cumulative value includes recorded failed attempts. A hard-killed process,
+  time between stages and remote judge costs have no recorded duration in this ledger.
+
+With a positive `--test_freq`, online runs evaluate before the initial update, at interval multiples,
+and at the end of each round. A boundary that is also an interval multiple triggers one evaluation.
+For 100 uninterrupted rounds of 10 steps with frequency 5 this gives 201 evaluation calls including step 0.
 
 ## Citation
 
