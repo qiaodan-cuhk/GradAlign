@@ -14,7 +14,7 @@ from typing import List, Tuple
 
 import datasets as hfds  # type: ignore[import-not-found]
 
-from config import add_dataset_roles, get_dataset_dir
+from config import add_dataset_roles, get_dataset_dir, parse_experiment_args
 from experiment import describe_datasets, record_experiment, run_lock
 from checkpoints import TRACKER, atomic_text, hf_weights_ready, latest_complete, mark_complete, resume_arguments
 from select_data import SELECTOR_REGISTRY
@@ -104,6 +104,7 @@ def chunk_dataset(train_dir: str, exp_root: str, train_parquet: str, chunk_size:
 
 def main():
     parser = argparse.ArgumentParser(description="Dynamic selection orchestrator: chunk → infer → analyze → aggregate → select → train")
+    parser.add_argument("--config", metavar="YAML", help="Experiment settings; explicit CLI arguments take precedence")
     parser.add_argument("--prefix", required=True, type=str)
     parser.add_argument("--model", required=True, type=str)
     parser.add_argument("--train_dataset", required=True, type=str)
@@ -164,7 +165,7 @@ def main():
                         help="Root directory where VERL checkpoints are saved")
     parser.add_argument("--merge_backend", type=str, default="megatron")
 
-    args = parser.parse_args()
+    args = parse_experiment_args(parser)
     strategy = SELECTOR_REGISTRY[args.mode]
     if args.rollout_n < 1:
         parser.error("--rollout_n must be positive")

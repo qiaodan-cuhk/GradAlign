@@ -86,3 +86,42 @@ def add_dataset_roles(parser):
                         help="Disjoint dataset used to report model performance")
     parser.add_argument("--heldout_dir", help="Override the directory containing the evaluation Parquet")
     parser.add_argument("--heldout_parquet", default="train.parquet")
+
+
+def parse_experiment_args(parser, argv=None):
+    """Apply a flat YAML experiment through the same types and choices as the CLI."""
+    import argparse
+    import sys
+    from pathlib import Path
+
+    argv = sys.argv[1:] if argv is None else argv
+    lookup = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    lookup.add_argument("--config")
+    path = lookup.parse_known_args(argv)[0].config
+    if path is None:
+        return parser.parse_args(argv)
+
+    import yaml
+
+    try:
+        values = yaml.safe_load(Path(path).expanduser().read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as exc:
+        parser.error(f"Cannot read experiment YAML {path}: {exc}")
+    if not isinstance(values, dict):
+        parser.error("Experiment YAML must be a mapping of argument names to values")
+    actions = {action.dest: action for action in parser._actions if action.dest not in ("help", "config")}
+    options = []
+    for key, value in values.items():
+        if key not in actions:
+            parser.error(f"Unknown experiment setting: {key}")
+        option = actions[key].option_strings[0]
+        if actions[key].nargs == 0:
+            if not isinstance(value, bool):
+                parser.error(f"{key} expects a YAML boolean")
+            if value:
+                options.append(option)
+        elif value is not None:
+            if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+                parser.error(f"{key} expects a scalar value")
+            options.append(f"{option}={value}")
+    return parser.parse_args([*options, *argv])

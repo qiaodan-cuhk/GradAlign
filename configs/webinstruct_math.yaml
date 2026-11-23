@@ -1,0 +1,18 @@
+# Example equal-step comparison. Change prefix and mode together for a new run.
+prefix: webinstruct_sim_s42
+model: qwen3-8b-base
+train_dataset: webinstruct
+selection_reference: amc22
+heldout_eval: amc23
+mode: sim
+seed: 42
+chunk_size: 5120
+k: 20
+num_selections: 100
+iters_per_select: 10
+train_batch_size: 128
+n_samples_train: 16
+n_samples_val: 16
+rollout_n: 16
+max_tokens: 3072
+max_model_len: 4096

@@ -77,7 +77,7 @@ def describe_datasets(train, reference, heldout):
 def record_experiment(root, args, datasets):
     manifest = root / "experiment.json"
     settings = {key: value for key, value in vars(args).items()
-                if key not in ("num_selections", "adopt_legacy_run")}
+                if key not in ("num_selections", "adopt_legacy_run", "config")}
     identity = {"version": 1, "settings": settings, "datasets": datasets}
     if manifest.exists():
         if json.loads(manifest.read_text()) != identity:

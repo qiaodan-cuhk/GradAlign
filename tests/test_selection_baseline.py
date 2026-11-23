@@ -93,6 +93,30 @@ def test_random_uses_only_current_chunk(experiment, monkeypatch):
     assert selections[0] == selections[1]
 
 
+def test_experiment_yaml_and_cli_drive_the_same_registry(experiment, tmp_path, monkeypatch):
+    import yaml
+
+    settings = dict(zip((s[2:] for s in experiment[1::2]), experiment[2::2]))
+    settings["selection_reference"] = settings.pop("val_dataset")
+    settings["heldout_eval"] = settings.pop("verl_val_set")
+    settings["mode"] = "sim"
+    settings["use_optimizer"] = False
+    path = tmp_path / "experiment.yaml"
+    path.write_text(yaml.safe_dump(settings))
+    monkeypatch.setattr(sys, "argv", ["dynamic_selection", "--config", str(path), "--mode", "rand_in_chunk"])
+    seen = []
+    monkeypatch.setattr(dynamic_selection, "run_rounds", lambda args, strategy, *rest: seen.append((args, strategy)))
+    dynamic_selection.main()
+    args, strategy = seen.pop()
+    assert args.rollout_n == 16
+    assert strategy is select_data.SELECTOR_REGISTRY["rand_in_chunk"]
+    assert not args.use_optimizer
+    for key, value in [("unknown", 3), ("rollout_n", "abc"), ("use_optimizer", "false")]:
+        path.write_text(yaml.safe_dump({**settings, key: value}))
+        with pytest.raises(SystemExit):
+            dynamic_selection.main()
+
+
 @pytest.mark.parametrize("answer, expected, correct", [
     (r"work then \boxed{0.5}", r"\frac{1}{2}", True),
     (r"\boxed{0.5} then \boxed{2}", r"\frac{1}{2}", False),
