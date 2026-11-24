@@ -61,6 +61,14 @@ def packed_adapter_ready(directory):
         return False
 
 
+def graft_policy_ready(directory, state):
+    try:
+        saved_state = (directory / "graft_state.txt").read_text().strip()
+    except OSError:
+        return False
+    return saved_state == state and nonempty(directory / "tokenizer_config.json") and hf_weights_ready(directory)
+
+
 def payload_ready(directory, backend, paired=False):
     actor = directory / "actor"
     if paired and not packed_adapter_ready(actor / "graft_adapter"):

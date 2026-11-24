@@ -4,7 +4,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import torch
-from checkpoints import hf_weights_ready
+from checkpoints import graft_policy_ready, hf_weights_ready
 
 
 @torch.inference_mode()
@@ -16,8 +16,10 @@ def export_policy(base_path, adapter_path, destination, state):
     if state not in ("full", "retain_only"):
         raise ValueError(f"Unknown adapter state {state}")
     destination = Path(destination)
-    if hf_weights_ready(destination):
+    if graft_policy_ready(destination, state):
         return
+    if destination.exists():
+        raise FileExistsError(f"Output exists without a complete {state} export: {destination}")
     cfg = LoraConfig.from_pretrained(adapter_path)
     tensors = load_file(Path(adapter_path) / "adapter_model.safetensors")
     base = AutoModelForCausalLM.from_pretrained(base_path, torch_dtype="auto")
@@ -39,6 +41,7 @@ def export_policy(base_path, adapter_path, destination, state):
         tokenizer.save_pretrained(stage)
         if not hf_weights_ready(stage):
             raise RuntimeError(f"Could not export {state} policy")
+        (stage / "graft_state.txt").write_text(state + "\n")
         stage.rename(destination)
 
 
