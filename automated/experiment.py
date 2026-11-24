@@ -12,11 +12,11 @@ from checkpoints import atomic_text
 
 
 @contextmanager
-def run_lock(directory):
+def run_lock(directory, *, wait=False):
     directory.mkdir(parents=True, exist_ok=True)
     with (directory / ".run.lock").open("a") as lock:
         try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(lock, fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             raise RuntimeError(f"Another experiment already owns {directory}") from exc
         yield
@@ -78,6 +78,13 @@ def record_experiment(root, args, datasets):
     manifest = root / "experiment.json"
     settings = {key: value for key, value in vars(args).items()
                 if key not in ("num_selections", "adopt_legacy_run", "config")}
+    # Old manifests predate the opt-in FSDP/adapter flags. Preserve their
+    # identity when a new invocation uses the original behavior.
+    defaults = dict(adapter_mode=None, branch_rank=4, forget_grad_scale=2.0, rollout_tp=None,
+                    greedy_eval=False, model_path=None, n_gpus_per_node=None, ppo_mini_batch_size=None,
+                    ppo_micro_batch_size_per_gpu=None, lr=None, initial_oracle_cache=False,
+                    retain_fraction=0.2, forget_fraction=0.2, rollout_max_num_batched_tokens=None, save_freq=None)
+    settings = {k: v for k, v in settings.items() if k not in defaults or v != defaults[k]}
     identity = {"version": 1, "settings": settings, "datasets": datasets}
     if manifest.exists():
         if json.loads(manifest.read_text()) != identity:

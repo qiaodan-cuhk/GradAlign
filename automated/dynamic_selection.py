@@ -8,6 +8,7 @@ import subprocess
 import sys
 import math
 import tempfile
+import time
 from itertools import islice
 import pyarrow.parquet as pq
 from pathlib import Path
@@ -15,13 +16,13 @@ from typing import List, Tuple
 
 import datasets as hfds  # type: ignore[import-not-found]
 
-from config import add_dataset_roles, get_dataset_dir, parse_experiment_args
+from config import add_dataset_roles, get_dataset_dir, get_model_path, parse_experiment_args
 from experiment import describe_datasets, record_experiment, run_lock
-from checkpoints import TRACKER, atomic_text, hf_weights_ready, latest_complete, mark_complete, resume_arguments
+from checkpoints import TRACKER, atomic_text, graft_policy_ready, hf_weights_ready, latest_complete, mark_complete, resume_arguments
 from select_data import SELECTOR_REGISTRY
 from timing import measure_stage
 from launch_verl_training import (DEFAULT_CHECKPOINT_ROOT, DEFAULT_ROLLOUT_N, DEFAULT_HELDOUT_ROLLOUT_N,
-                                  DEFAULT_TEST_FREQ, VERL_PACKAGE, build_exp_name)
+                                  DEFAULT_TEST_FREQ, VERL_PACKAGE, add_adapter_options, build_exp_name)
 
 
 def _load_train_dataset(train_dir: str, train_parquet: str):
@@ -170,9 +171,29 @@ def main():
     parser.add_argument("--ckpt_root", type=str, default=DEFAULT_CHECKPOINT_ROOT,
                         help="Root directory where VERL checkpoints are saved")
     parser.add_argument("--merge_backend", type=str, default="megatron")
+    parser.add_argument("--model_path", help="Mounted HF base used by both training and Oracle analysis")
+    parser.add_argument("--n_gpus_per_node", type=int)
+    parser.add_argument("--ppo_mini_batch_size", type=int)
+    parser.add_argument("--ppo_micro_batch_size_per_gpu", type=int)
+    parser.add_argument("--rollout_max_num_batched_tokens", type=int)
+    parser.add_argument("--save_freq", type=int, help="Checkpoint interval in GRPO steps")
+    parser.add_argument("--lr", type=float)
+    parser.add_argument("--initial_oracle_cache", action="store_true",
+                        help="Share the base model's round-zero Oracle between matched runs")
+    parser.add_argument("--retain_fraction", type=float, default=0.2)
+    parser.add_argument("--forget_fraction", type=float, default=0.2)
+    add_adapter_options(parser)
 
     args = parse_experiment_args(parser)
     strategy = SELECTOR_REGISTRY[args.mode]
+    if (args.mode == "sim_route") != (args.adapter_mode == "routed"):
+        parser.error("sim_route and the routed actor must be selected together")
+    if args.mode == "sim_route" and args.k != 1:
+        parser.error("sim_route requires k=1")
+    if args.adapter_mode and (args.merge_backend != "fsdp" or args.use_optimizer):
+        parser.error("The paired adapter pilot uses FSDP and the raw gradient Oracle")
+    if args.model_path:
+        args.model_path = str(Path(args.model_path).expanduser().resolve())
     if args.epochs_per_select != 1:
         print("--epochs_per_select is ignored; --iters_per_select sets the GRPO step budget.", file=sys.stderr)
     if min(args.rollout_n, args.rollout_val_n) < 1:
@@ -322,15 +343,19 @@ def select_round(args, strategy, exp_name, chunk, val_dir, step_root, round_inde
     parts = step_root / "train_split"
     part = parts / "part_0"
     options = []
-    model_path = None
+    model_path = args.model_path
+    if model_path:
+        options = ["--model_path", model_path]
     if step and strategy.candidate_rollouts:
-        model_path = step_root / "actor" / "huggingface"
+        model_path = step_root / "merged" / "full" if args.adapter_mode else step_root / "actor" / "huggingface"
         if not hf_weights_ready(model_path):
+            if args.adapter_mode:
+                raise RuntimeError(f"Missing exported full policy at {model_path}")
             model_path = step_root / "merged"
             if not hf_weights_ready(model_path):
                 run_script("merge_model.py", "--experiment_name", exp_name, "--step", step, "--output_model_name", exp_name,
                            "--backend", args.merge_backend, "--ckpt_root", args.ckpt_root, "--target_dir", model_path)
-        options.extend(["--model_path", model_path])
+        options = ["--model_path", model_path]
         if args.use_optimizer and strategy.gradient:
             optimizer = step_root / "opt_converted"
             run_script("convert_megatron_optimizer_to_hf.py", "--checkpoint_path", step_root / "actor",
@@ -359,7 +384,73 @@ def select_round(args, strategy, exp_name, chunk, val_dir, step_root, round_inde
     run_script("select_data.py", "--mode", args.mode, "--dataset", args.train_dataset, "--model", args.model,
                "--n", size, "--output_dir", output, "--candidate_dir", chunk, "--seed", args.seed + round_index,
                "--min_problems", args.min_problems, "--max_problems", args.max_problems,
-               "--parts_root", parts, "--acc_low", args.acc_low, "--acc_high", args.acc_high)
+               "--parts_root", parts, "--acc_low", args.acc_low, "--acc_high", args.acc_high,
+               "--retain_fraction", args.retain_fraction, "--forget_fraction", args.forget_fraction)
+
+
+def export_round(args, root, step):
+    if not args.adapter_mode or not step:
+        return
+    directory = root / f"global_step_{step}"
+    states = ("full", "retain_only") if args.adapter_mode == "routed" else ("full",)
+    for state in states:
+        destination = directory / "merged" / state
+        if not graft_policy_ready(destination, state):
+            with measure_stage(root, f"export_{state}", args.allocated_gpus, step=step):
+                run_script("export_graft.py", "--base_model", args.model_path or get_model_path(args.model),
+                           "--adapter_dir", directory / "actor/graft_adapter", "--output_dir", destination,
+                           "--state", state)
+
+
+def initial_oracle_key(args, chunk, reference):
+    model = Path(args.model_path or get_model_path(args.model))
+    model_files = sorted(p for p in model.iterdir() if p.is_file() and
+                         p.suffix in (".safetensors", ".bin", ".json", ".jinja", ".model", ".txt"))
+    if not any(p.suffix in (".safetensors", ".bin") for p in model_files):
+        raise ValueError(f"Shared Oracle requires a local model snapshot: {model}")
+    settings = {key: getattr(args, key) for key in (
+        "seed", "model", "train_dataset", "selection_reference", "n_samples_train", "n_samples_val",
+        "min_problems", "max_problems", "temperature", "max_tokens", "max_model_len", "analysis_gpus",
+        "minibatch_size", "tensor_parallel_size", "pipeline_parallel_size", "use_model_judge", "reward_path",
+        "train_infer_batch_size", "val_infer_batch_size", "concurrency")}
+    digest = hashlib.sha256(json.dumps(settings, sort_keys=True).encode())
+    repo = VERL_PACKAGE.parents[1]
+    inputs = [chunk / "train.jsonl", reference, *model_files, *sorted((repo / "select/parallel").glob("*.py")),
+              repo / "select/inference_ray_batch.py", repo / "select/utils.py", Path(__file__).with_name("aggregate.py"),
+              VERL_PACKAGE / "utils/reward_score/math_reward.py"]
+    for path in inputs:
+        content = hashlib.sha256()
+        with path.open("rb") as stream:
+            for block in iter(lambda: stream.read(1 << 20), b""):
+                content.update(block)
+        digest.update(path.name.encode() + content.digest())
+    return digest.hexdigest()
+
+
+def select_initial_shared(args, strategy, exp_name, chunk, val_dir, output, size):
+    key = initial_oracle_key(args, chunk, Path(val_dir) / "train.jsonl")
+    cache = Path(args.ckpt_root) / ".initial_oracle" / key
+    requested = time.monotonic()
+    with run_lock(cache, wait=True):
+        receipt = cache / "oracle.json"
+        reused = receipt.exists()
+        start = time.monotonic()
+        select_round(args, strategy, exp_name, chunk, val_dir, cache, 0, output, size)
+        if not reused:
+            elapsed = time.monotonic() - start
+            atomic_text(receipt, json.dumps({"key": key, "built_by": exp_name, "wall_seconds": elapsed,
+                                             "gpu_hours": elapsed * args.allocated_gpus / 3600
+                                             if args.allocated_gpus is not None else None}))
+        record = json.loads(receipt.read_text())
+        record["reused"] = reused
+        record["standalone_gpu_hour_adjustment"] = 0.0
+        if reused and args.allocated_gpus is not None:
+            # Replace the actual wait/reuse interval with a standalone Oracle
+            # build. The physical allocation ledger still contains the real wait.
+            record["standalone_gpu_hour_adjustment"] = (
+                record["wall_seconds"] - (time.monotonic() - requested)
+            ) * args.allocated_gpus / 3600
+        atomic_text(output / "initial_oracle.json", json.dumps(record, indent=2))
 
 
 def run_rounds(args, strategy, exp_name, train_dir, val_dir, heldout_dir):
@@ -370,7 +461,9 @@ def run_rounds(args, strategy, exp_name, train_dir, val_dir, heldout_dir):
     size = candidate_count // args.k
     if size < args.train_batch_size:
         raise ValueError(f"Selected subset of {size} cannot form one batch of {args.train_batch_size}")
-    resume_step = latest_complete(checkpoint_dir, args.iters_per_select, args.merge_backend)
+    resume_step = latest_complete(checkpoint_dir, args.iters_per_select, args.merge_backend, bool(args.adapter_mode))
+    if resume_step % args.iters_per_select == 0:
+        export_round(args, checkpoint_dir, resume_step)
     for i in range(resume_step // args.iters_per_select, args.num_selections):
         gstep = i * args.iters_per_select
         iter_out = checkpoint_dir / "selected" / f"iter_{i}_{args.mode}_{size}"
@@ -379,8 +472,12 @@ def run_rounds(args, strategy, exp_name, train_dir, val_dir, heldout_dir):
                 raise RuntimeError(f"Missing selected dataset for in-round resume at step {resume_step}: {iter_out}")
         else:
             with measure_stage(checkpoint_dir, "selection", args.allocated_gpus, step=gstep):
-                select_round(args, strategy, exp_name, chunks[i % len(chunks)], val_dir,
-                             checkpoint_dir / f"global_step_{gstep}", i, iter_out, size)
+                chunk = chunks[i % len(chunks)]
+                if i == 0 and args.initial_oracle_cache and strategy.gradient == "sim" and strategy.reference_rollouts:
+                    select_initial_shared(args, strategy, exp_name, chunk, val_dir, iter_out, size)
+                else:
+                    select_round(args, strategy, exp_name, chunk, val_dir,
+                                 checkpoint_dir / f"global_step_{gstep}", i, iter_out, size)
 
         selected_count = pq.read_metadata(iter_out / "train.parquet").num_rows
         if selected_count < args.train_batch_size:
@@ -408,6 +505,16 @@ def run_rounds(args, strategy, exp_name, train_dir, val_dir, heldout_dir):
             '--train_batch_size', str(args.train_batch_size),
             '--max_response_length', str(args.max_tokens),
         ]
+        for key in ("model_path", "n_gpus_per_node", "ppo_mini_batch_size", "ppo_micro_batch_size_per_gpu",
+                    "lr", "rollout_tp", "rollout_max_num_batched_tokens", "save_freq"):
+            value = getattr(args, key)
+            if value is not None:
+                train_cmd.extend([f"--{key}", str(value)])
+        if args.adapter_mode:
+            train_cmd.extend(["--adapter_mode", args.adapter_mode, "--branch_rank", str(args.branch_rank),
+                              "--forget_grad_scale", str(args.forget_grad_scale), "--seed", str(args.seed)])
+        if args.greedy_eval:
+            train_cmd.append("--greedy_eval")
         if args.reward_manager:
             train_cmd.extend(["--reward_manager", args.reward_manager])
         if args.reward_path:
@@ -421,7 +528,8 @@ def run_rounds(args, strategy, exp_name, train_dir, val_dir, heldout_dir):
             subprocess.run(train_cmd, check=True)
         if (checkpoint_dir / TRACKER).read_text().strip() != str(end_step):
             raise RuntimeError(f"Trainer did not reach the requested checkpoint at step {end_step}")
-        mark_complete(checkpoint_dir, end_step, args.merge_backend)
+        mark_complete(checkpoint_dir, end_step, args.merge_backend, bool(args.adapter_mode))
+        export_round(args, checkpoint_dir, end_step)
         resume_step = end_step
 
 

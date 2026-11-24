@@ -6,6 +6,7 @@ import subprocess
 import sys
 import json
 from pathlib import Path
+import time
 
 from config import get_model_path, get_dataset_dir
 from checkpoints import atomic_text
@@ -24,6 +25,14 @@ def build_exp_name(prefix: str, model_name: str, train_dataset, train_dir: str, 
     train_name = os.path.basename(os.path.normpath(train_dir))
     val_name = os.path.basename(os.path.normpath(val_dir))
     return f"{prefix}_{model_name}_{train_dataset}_{train_name}_{val_name}"
+
+
+def add_adapter_options(parser):
+    parser.add_argument("--adapter_mode", choices=["paired", "routed"])
+    parser.add_argument("--branch_rank", default=4, type=int)
+    parser.add_argument("--forget_grad_scale", default=2.0, type=float)
+    parser.add_argument("--rollout_tp", type=int)
+    parser.add_argument("--greedy_eval", action="store_true")
 
 
 def main():
@@ -49,7 +58,7 @@ def main():
     parser.add_argument("--max_prompt_length", type=int, default=1024)
     parser.add_argument("--max_response_length", type=int, default=4096)
     parser.add_argument("--ppo_mini_batch_size", type=int, default=32)
-    parser.add_argument("--ppo_micro_batch_size_per_gpu", type=int, default=2)
+    parser.add_argument("--ppo_micro_batch_size_per_gpu", type=int)
     parser.add_argument("--lr", type=float, default=1e-6)
     parser.add_argument("--use_kl_loss", action="store_true", default=True)
     parser.add_argument("--entropy_coeff", type=float, default=0.0)
@@ -99,7 +108,20 @@ def main():
     parser.add_argument("--backend", default="megatron", type=str)
     parser.add_argument("--reward_manager", default="naive", type=str)
 
+    parser.add_argument("--seed", type=int, default=42)
+    add_adapter_options(parser)
     args = parser.parse_args()
+    if args.ppo_micro_batch_size_per_gpu is None:
+        args.ppo_micro_batch_size_per_gpu = 2 if args.backend == "megatron" else 16
+    if args.greedy_eval:
+        args.rollout_val_do_sample, args.rollout_val_temperature = False, 0.0
+    if args.adapter_mode:
+        if args.backend != "fsdp" or args.branch_rank < 1 or args.forget_grad_scale <= 0:
+            parser.error("Paired adapters require FSDP, positive rank and positive gradient scale")
+        dp = args.n_gpus_per_node * args.nnodes
+        if (args.train_batch_size % args.ppo_mini_batch_size or
+                args.ppo_mini_batch_size * args.rollout_n % (dp * args.ppo_micro_batch_size_per_gpu)):
+            parser.error("Per-rank GRPO mini-batches must be divisible by the configured micro-batch")
     if min(args.rollout_n, args.rollout_val_n) < 1:
         parser.error("Training and held-out rollout counts must be positive")
     if args.allocated_gpus is not None and args.allocated_gpus < 0:
@@ -201,7 +223,7 @@ def main():
             f"actor_rollout_ref.model.path={model_path}",
             f"actor_rollout_ref.actor.optim.lr={args.lr}",
             f"actor_rollout_ref.actor.ppo_mini_batch_size={args.ppo_mini_batch_size}",
-            f"actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu={int(args.ppo_micro_batch_size_per_gpu) * 8}",
+            f"actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu={args.ppo_micro_batch_size_per_gpu}",
             f"actor_rollout_ref.actor.use_kl_loss={str(args.use_kl_loss)}",
             f"actor_rollout_ref.actor.entropy_coeff={args.entropy_coeff}",
             f"actor_rollout_ref.actor.kl_loss_coef={args.kl_loss_coef}",
@@ -214,8 +236,8 @@ def main():
             f"actor_rollout_ref.rollout.val_kwargs.temperature={args.rollout_val_temperature}",
             f"actor_rollout_ref.rollout.val_kwargs.n={args.rollout_val_n}",
             f"actor_rollout_ref.rollout.max_num_batched_tokens={args.rollout_max_num_batched_tokens}",
-            "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=40",
-            "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=40",
+            f"actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu={args.ppo_micro_batch_size_per_gpu if args.adapter_mode else 40}",
+            f"actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu={args.ppo_micro_batch_size_per_gpu if args.adapter_mode else 40}",
             f"actor_rollout_ref.rollout.gpu_memory_utilization={args.gpu_memory_utilization}",
             "trainer.logger=['console','tensorboard']",
             f"custom_reward_function.path={reward_path}",
@@ -232,6 +254,39 @@ def main():
             f"reward_model.reward_manager={args.reward_manager}",
         ]
 
+    if args.rollout_tp is not None:
+        if args.rollout_tp < 1 or args.n_gpus_per_node % args.rollout_tp:
+            parser.error("rollout_tp must divide n_gpus_per_node")
+        cmd.append(f"actor_rollout_ref.rollout.tensor_model_parallel_size={args.rollout_tp}")
+    if args.adapter_mode:
+        packed_rank = 2 * args.branch_rank
+        cmd.extend([
+            f"+actor_rollout_ref.graft.mode={args.adapter_mode}",
+            f"+actor_rollout_ref.graft.seed={args.seed}",
+            f"+actor_rollout_ref.graft.forget_grad_scale={args.forget_grad_scale}",
+            f"actor_rollout_ref.model.lora_rank={packed_rank}",
+            f"actor_rollout_ref.model.lora_alpha={packed_rank}",
+            "actor_rollout_ref.model.target_modules=[q_proj,v_proj]",
+            "actor_rollout_ref.actor.fsdp_config.use_orig_params=true",
+            "actor_rollout_ref.actor.ppo_epochs=1", "actor_rollout_ref.model.use_remove_padding=false",
+            "actor_rollout_ref.actor.use_dynamic_bsz=false", "actor_rollout_ref.actor.use_torch_compile=false",
+            "actor_rollout_ref.rollout.load_format=safetensors",
+            "actor_rollout_ref.rollout.layered_summon=true", "actor_rollout_ref.rollout.mode=sync",
+            f"+actor_rollout_ref.rollout.seed={args.seed}", f"data.seed={args.seed}",
+            "data.validation_shuffle=false",
+        ])
+        if args.adapter_mode == "routed":
+            cmd.extend(["data.custom_cls.path=pkg://verl.utils.dataset.routed_dataset",
+                        "data.custom_cls.name=RoutedRLHFDataset"])
+        ledger = Path(ckpts_dir) / "timings.jsonl"
+        prior = json.loads(ledger.read_text().splitlines()[-1])["cumulative_gpu_hours"] if ledger.exists() else 0
+        if args.allocated_gpus is not None and prior is not None:
+            receipts = list(Path(ckpts_dir).glob("selected/iter_0_*/initial_oracle.json"))
+            adjustment = json.loads(receipts[0].read_text())["standalone_gpu_hour_adjustment"] if receipts else 0.0
+            cmd.extend([f"+actor_rollout_ref.graft.prior_gpu_hours={prior}",
+                        f"+actor_rollout_ref.graft.allocated_gpus={args.allocated_gpus}",
+                        f"+actor_rollout_ref.graft.standalone_adjustment={adjustment}",
+                        f"+actor_rollout_ref.graft.start_time={time.time()}"])
     if args.resume_from_path:
         cmd = [arg for arg in cmd if not arg.startswith("trainer.resume_mode=")]
         cmd.extend(["trainer.resume_mode=resume_path", f"trainer.resume_from_path={args.resume_from_path}"])
