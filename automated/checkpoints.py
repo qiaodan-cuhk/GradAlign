@@ -42,8 +42,29 @@ def hf_weights_ready(directory):
     return False
 
 
-def payload_ready(directory, backend):
+def packed_adapter_ready(directory):
+    from safetensors import SafetensorError, safe_open
+
+    try:
+        rank = json.loads((directory / "adapter_config.json").read_text())["r"]
+        if type(rank) is not int or rank < 2 or rank % 2:
+            return False
+        with safe_open(directory / "adapter_model.safetensors", framework="np") as weights:
+            keys = set(weights.keys())
+            a_keys = {k for k in keys if k.endswith(".lora_A.weight")}
+            pairs = [(a, a.removesuffix(".lora_A.weight") + ".lora_B.weight") for a in a_keys]
+            return bool(pairs) and keys == a_keys | {b for _, b in pairs} and all(
+                weights.get_slice(a).get_shape()[0] == weights.get_slice(b).get_shape()[1] == rank
+                for a, b in pairs
+            )
+    except (OSError, KeyError, IndexError, TypeError, ValueError, SafetensorError):
+        return False
+
+
+def payload_ready(directory, backend, paired=False):
     actor = directory / "actor"
+    if paired and not packed_adapter_ready(actor / "graft_adapter"):
+        return False
     if backend == "fsdp":
         try:
             size = json.loads((actor / "fsdp_config.json").read_text())["world_size"]
@@ -83,14 +104,14 @@ def payload_ready(directory, backend):
         return False
 
 
-def mark_complete(root, step, backend):
+def mark_complete(root, step, backend, paired=False):
     directory = root / f"global_step_{step}"
-    if not nonempty(directory / "data.pt") or not payload_ready(directory, backend):
+    if not nonempty(directory / "data.pt") or not payload_ready(directory, backend, paired):
         raise RuntimeError(f"Incomplete {backend} checkpoint at {directory}")
     atomic_text(directory / MARKER, json.dumps({"step": step, "backend": backend}) + "\n")
 
 
-def latest_complete(root, interval, backend):
+def latest_complete(root, interval, backend, paired=False):
     try:
         tracked = int((root / TRACKER).read_text().strip())
     except (OSError, ValueError):
@@ -113,7 +134,7 @@ def latest_complete(root, interval, backend):
         # Older runs removed data.pt at a round boundary to switch datasets.
         if step % interval and not nonempty(directory / "data.pt"):
             continue
-        if payload_ready(directory, backend):
+        if payload_ready(directory, backend, paired):
             if step != tracked:
                 atomic_text(root / TRACKER, str(step))
             return step
