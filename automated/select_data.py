@@ -24,12 +24,14 @@ class SelectionInputs:
     acc_high: float
     limit: int | None
     parts_root: Path | None
+    retain_fraction: float = 0.2
+    forget_fraction: float = 0.2
 
 
 @dataclass
 class RoutedSelection:
     """A selector can annotate every eligible prompt for a route-aware consumer."""
-    route_tags: dict[int, str]
+    route_tags: dict[int, int | str]
     align_scores: dict[int, float] = field(default_factory=dict)
 
 
@@ -48,6 +50,24 @@ class Selector:
 
 def by_similarity(data):
     return sorted(data.similarity, key=data.similarity.get, reverse=True)[:data.n]
+
+
+def by_similarity_route(data):
+    if data.n != len(data.ids) or set(data.similarity) != set(data.ids):
+        raise ValueError("sim_route requires k=1 and a finite score for every candidate")
+    if not (0 < data.retain_fraction < 1 and 0 < data.forget_fraction < 1
+            and data.retain_fraction + data.forget_fraction <= 1):
+        raise ValueError("Invalid retain/forget fractions")
+    # Use the exact ranking (including its stable ties) consumed by hard filtering.
+    ranked = by_similarity(data)
+    top = int(len(ranked) * data.retain_fraction)
+    bottom = int(len(ranked) * data.forget_fraction)
+    if min(top, bottom) < 1:
+        raise ValueError("Candidate window is too small for the configured route fractions")
+    tags = dict.fromkeys(ranked, 0)
+    tags.update(dict.fromkeys(ranked[:top], 1))
+    tags.update(dict.fromkeys(ranked[-bottom:], 2))
+    return RoutedSelection(tags, data.similarity)
 
 
 def by_negative_similarity(data):
@@ -77,6 +97,7 @@ def random_in_chunk(data):
 
 SELECTOR_REGISTRY = {
     "sim": Selector(by_similarity, gradient="sim", reference_rollouts=True),
+    "sim_route": Selector(by_similarity_route, gradient="sim", reference_rollouts=True),
     "dot": Selector(by_similarity, gradient="dot", reference_rollouts=True),
     "norm": Selector(by_similarity, gradient="norm"),
     "align": Selector(by_similarity, gradient="sim"),
@@ -108,7 +129,7 @@ def _scores(path, key, pool):
 def select_from_chunk(mode, dataset_dir, parts_root, n, output_dir, *,
                       similarity_filename="similarity_results_aggregated.jsonl",
                       acc_low=0.2, acc_high=0.8, limit=None, rng=None,
-                      first_problem=1, last_problem=None):
+                      first_problem=1, last_problem=None, retain_fraction=0.2, forget_fraction=0.2):
     strategy = SELECTOR_REGISTRY[mode]
     source = Path(dataset_dir) / "train.jsonl"
     with source.open(encoding="utf-8") as f:
@@ -129,13 +150,15 @@ def select_from_chunk(mode, dataset_dir, parts_root, n, output_dir, *,
     data = SelectionInputs(
         ids, _scores(parts / "accuracy_by_problem.jsonl", "accuracy", pool) if strategy.use_accuracy else {},
         _scores(parts / similarity_filename, "similarity", pool) if strategy.gradient else {},
-        n, rng if rng is not None else random.Random(), acc_low, acc_high, limit, parts,
+        n, rng if rng is not None else random.Random(), acc_low, acc_high, limit, parts, retain_fraction, forget_fraction,
     )
     result = strategy.choose(data)
     if isinstance(result, RoutedSelection):
         if set(result.route_tags) != pool or not set(result.align_scores) <= pool:
             raise ValueError("Routing must cover exactly the current candidate pool")
-        if any(tag not in ("retain", "both", "forget") for tag in result.route_tags.values()):
+        tags = list(result.route_tags.values())
+        if not (all(type(tag) is int and tag in (0, 1, 2) for tag in tags)
+                or all(tag in ("retain", "both", "forget") for tag in tags)):
             raise ValueError("Invalid route_tag")
         if any(not math.isfinite(score) for score in result.align_scores.values()):
             raise ValueError("Invalid align_score")
@@ -198,6 +221,8 @@ def main():
     parser.add_argument("--n", type=int, default=10000)
     parser.add_argument("--acc_low", type=float, default=0.2)
     parser.add_argument("--acc_high", type=float, default=0.8)
+    parser.add_argument("--retain_fraction", type=float, default=0.2)
+    parser.add_argument("--forget_fraction", type=float, default=0.2)
     parser.add_argument("--lim", type=int)
     parser.add_argument("--min_problems", type=int, default=1)
     parser.add_argument("--max_problems", type=int)
@@ -219,7 +244,8 @@ def main():
     out = args.output_dir or Path(directory) / "selected" / args.model / f"{name}_{args.n}"
     select_from_chunk(args.mode, directory, parts, args.n, out, similarity_filename=args.similarity_filename,
                       acc_low=args.acc_low, acc_high=args.acc_high, limit=args.lim, rng=random.Random(args.seed),
-                      first_problem=args.min_problems, last_problem=args.max_problems)
+                      first_problem=args.min_problems, last_problem=args.max_problems,
+                      retain_fraction=args.retain_fraction, forget_fraction=args.forget_fraction)
     print(f"Selection complete. Output: {out}")
 
 
