@@ -274,3 +274,42 @@ For 100 uninterrupted rounds of 10 steps with frequency 5 this gives 201 evaluat
 ## Acknowledgment
 
 This repository is built on top of VERL (`verl/`) and includes project-specific modifications for GradAlign data selection and analysis.
+
+## Four-GPU Oracle routing pilot
+
+The three recipes share the frozen `Qwen/Qwen2.5-Math-1.5B-Instruct` base, two rank-4 LoRA adapters on `q_proj` and `v_proj`, FSDP1, and the existing math reward. Use a single-node CUDA environment with the checkout's veRL, Ray Data LLM, Accelerate and synchronous vLLM LoRA support. Install this checkout with `python -m pip install --no-deps -e ./verl` in that environment. The sync vLLM backend uses the V0 engine interface.
+
+| Recipe | Data used for ten GRPO steps |
+| --- | --- |
+| `configs/graft_a_hard.yaml` | Highest 16 of 80 by reference-gradient similarity, vanilla GRPO |
+| `configs/graft_b_all.yaml` | Same pool of 80, vanilla GRPO, skips the Oracle |
+| `configs/graft_c_route.yaml` | All 80, with 16 retain-only, 48 both, 16 forget-only, forget-only gradient scale 2 |
+
+Mount the same safetensors base snapshot for all arms (model revision `aafeb0fc6f22cbf0eaeed126eff8be45b0360a35` was used to verify tokenization). The preparation command pins the upstream WebInstruct and AMC revisions, records source IDs, checks the chat prompt length, and writes three disjoint datasets in a dedicated directory. It also accepts the original parquet files via `--web_parquet` and `--amc_parquet` for an offline machine.
+
+```bash
+export MODEL_DIR=/models/Qwen2.5-Math-1.5B-Instruct
+export GRADALIGN_DATA_ROOT=/data/gradalign-graft-pilot
+export CKPT_DIR=/checkpoints/gradalign-graft-pilot
+python automated/prepare_graft_pilot.py --model_path "$MODEL_DIR"
+
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+export RAY_ADDRESS=local
+export VLLM_USE_V1=0
+(
+    set -e
+    for arm in a_hard b_all c_route
+    do
+        python automated/dynamic_selection.py --config "configs/graft_${arm}.yaml" \
+            --model_path "$MODEL_DIR" --ckpt_root "$CKPT_DIR"
+    done
+)
+```
+
+Each arm uses 8 prompts per step and 16 fresh answers per prompt. The Oracle uses 4 answers per candidate and 8 per AMC22 reference prompt. Greedy pass@1 is measured on all 40 AMC23 prompts at steps 0, 5 and 10. In an 8-GPU container, parallel jobs can use distinct four-device visibility masks and their own local Ray instances. Give each arm/seed a distinct prefix and share the checkpoint root to reuse round-zero Oracle scores.
+
+- `selected/iter_*/train.parquet` carries the actual training prompts. C also writes `routes.json` with group sizes and the fraction of candidate groups with constant rewards.
+- `heldout_metrics.jsonl` records `val_full`, C's `val_retain_only`, GRPO steps and cumulative allocated GPU hours. The standalone estimate replaces a shared Oracle wait or cache hit with its measured build cost. `timings.jsonl` includes final export time. Training metrics include the response fraction and the global pre-clip parameter-gradient norm contributed by each route.
+- `global_step_*/actor/` stores sharded model and optimizer state for resuming. At a round boundary `merged/full/` is a standard HF policy for the next Oracle, and C also exports `merged/retain_only/`. Evaluation packs an inference copy of the adapters and leaves the training parameters active. Later rounds score with their own full policies.
+
+To check the actual GPU environment first, run C with the same recipe and append `--prefix graft_gpu_check --iters_per_select 1 --num_selections 2 --test_freq 1`. This exercises one checkpoint handoff, the second Oracle, and both evaluation states. The CPU suite and its exact command are in [REPO_CONTRACT.md](REPO_CONTRACT.md).

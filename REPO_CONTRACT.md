@@ -19,8 +19,8 @@
 - `extra_info.index` 标识当前数据集的原题，进程间与断点都使用这个 ID。
 - 裁剪型选择器返回本轮候选 ID 列表，每题最多一次，公共写出器生成 JSONL 与 `train.parquet`。
 - 路由型选择器可返回 `RoutedSelection`，为当前候选窗口的每道题给出一个标签，并可附加分数。
-- 对整池路由实验设 `k: 1`。Parquet 顶层的 `align_score` 为可空浮点数，`route_tag` 取 `retain`、`both`、`forget`。
-- 现有 GRPO 读入所选题目。按标签给 Adapter 分配梯度属于后续训练侧实验。
+- 整池 `sim_route` 使用 `k: 1`，写出每道题的浮点 `align_score` 和整数 `route_tag`。0 表示双分支，1 表示仅保留分支，2 表示仅遗忘分支。
+- 原版 GRPO 忽略选题元数据。C 组的 `RoutedRLHFDataset` 将标签作为样本张量传给独立的 `RoutedPPOActor`。
 - `n_samples_train` 和 `n_samples_val` 是选题侧每题回答数，`rollout_n` 是正式训练每题新生成的回答数。
 - `train_batch_size` 计题目，`iters_per_select` 计 GRPO step。比较方法时单独记录两者和每题回答数。
 
@@ -38,7 +38,7 @@
 每个改动和 PR 上 GPU 前，在装有本仓库 veRL 及 pytest 的环境中从仓库根目录执行同一条命令。
 
 ```bash
-OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python -m pytest -q tests/test_selection_baseline.py verl/tests/trainer/ppo/test_core_algos_on_cpu.py::test_grpo_and_vectorized_equivalence
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 TOKENIZERS_PARALLELISM=false python -m pytest -q tests/test_selection_baseline.py tests/test_graft_*.py verl/tests/trainer/ppo/test_core_algos_on_cpu.py::test_grpo_and_vectorized_equivalence
 ```
 
-用例包含 14 道合成候选题、真实分块与 Parquet 读写、子进程参数、断点续训以及 3 组 GRPO 优势等价测试。GPU 阶段在冒烟中由测试替身接管。
+用例覆盖 14 道合成候选题、3 组 GRPO 优势、四进程 CPU FSDP 路由与优化器续训、双态 HF 导出，以及三份 YAML 的训练入口。GPU rollout 与 Oracle 分析在调度测试中使用替身。
