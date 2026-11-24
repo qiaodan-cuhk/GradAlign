@@ -186,6 +186,16 @@ def select_from_chunk(mode, dataset_dir, parts_root, n, output_dir, *,
     if isinstance(result, RoutedSelection):
         dataset = dataset.cast_column("align_score", hfds.Value("float64"))
     dataset.to_parquet(str(out / "train.parquet"))
+    if mode == "sim_route":
+        counts = {name: sum(tag == i for tag in result.route_tags.values())
+                  for i, name in enumerate(("both", "retain_only", "forget_only"))}
+        summary = {"counts": counts, "fractions": {name: count / len(pool) for name, count in counts.items()}}
+        accuracy = parts / "accuracy_by_problem.jsonl"
+        if accuracy.is_file():
+            rates = _scores(accuracy, "accuracy", pool)
+            if rates.keys() == pool:
+                summary["zero_advantage_fraction"] = sum(p in (0, 1) for p in rates.values()) / len(pool)
+        (out / "routes.json").write_text(json.dumps(summary, indent=2) + "\n")
     return selected
 
 
