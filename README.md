@@ -285,6 +285,8 @@ The three recipes share the frozen `Qwen/Qwen2.5-Math-1.5B-Instruct` base, two r
 | `configs/graft_b_all.yaml` | Same pool of 80, vanilla GRPO, skips the Oracle |
 | `configs/graft_c_route.yaml` | All 80, with 16 retain-only, 48 both, 16 forget-only, forget-only gradient scale 2 |
 
+The prepared pilot datasets ship with this branch. To use them offline, set `GRADALIGN_DATA_ROOT="$PWD/test_data"` at the repository root. An existing Docker checkout can use the standalone archive containing the same data and one-step launch scripts. [Offline pilot data and download](test_data/README.md)
+
 Mount the same safetensors base snapshot for all arms (model revision `aafeb0fc6f22cbf0eaeed126eff8be45b0360a35` was used to verify tokenization). The preparation command pins the upstream WebInstruct and AMC revisions, records source IDs, checks the chat prompt length, and writes three disjoint datasets in a dedicated directory. It also accepts the original parquet files via `--web_parquet` and `--amc_parquet` for an offline machine.
 
 ```bash
