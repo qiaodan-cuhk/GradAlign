@@ -4,6 +4,7 @@ Centralized configuration for model paths and common constants.
 Users should update `MODELS` to reflect their local/remote model store.
 """
 
+import os
 from typing import Dict
 
 
@@ -19,7 +20,7 @@ REWARD_STYLE: str = "rule-lighteval/MATH_v2"
 
 
 # Base directory for auto-selected dataset outputs
-BASE_DATA_DIR: str = "/path/to/data" #SET YOUR OWN PATH
+BASE_DATA_DIR: str = os.environ.get("GRADALIGN_DATA_ROOT", "/path/to/data")
 
 # Base directory for API responses
 BASE_RESPONSES_DIR: str = "/path/to/responses" #SET YOUR OWN PATH
