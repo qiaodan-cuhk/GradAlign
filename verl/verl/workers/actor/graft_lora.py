@@ -133,18 +133,32 @@ def packed_adapter(model, state="full"):
     """Gather adapter tensors from FSDP1 and pack B_R A_R + B_F A_F at unchanged alpha/r."""
     if state not in STATES:
         raise ValueError(f"Unknown GRAFT inference state {state}")
-    gather = FSDP.summon_full_params(model, writeback=False) if isinstance(model, FSDP) else nullcontext()
+    sharded = isinstance(model, FSDP)
+    peft_model = model.module if sharded else model
+    layers = [(name, layer) for name, layer in peft_model.named_modules() if isinstance(layer, PeftLinear)]
+    # The pilot wraps trainable LoRA leaves separately. Summon only those
+    # shards so a rollout switch never materializes the entire frozen base.
+    wrapped_leaves = sharded and all(
+        isinstance(factors[k], FSDP) for _, layer in layers for factors in (layer.lora_A, layer.lora_B) for k in BRANCHES
+    )
+    if wrapped_leaves:
+        model.check_is_root()  # lazy-initialize the hierarchy from the actual root
+
+    def read_factor(factor):
+        if wrapped_leaves:
+            with FSDP.summon_full_params(factor, recurse=False, writeback=False):
+                return factor.module.weight.detach().to("cpu", copy=True)
+        return factor.weight.detach().cpu()
+
+    gather = FSDP.summon_full_params(model, writeback=False) if sharded and not wrapped_leaves else nullcontext()
     with gather:
-        peft_model = model.module if isinstance(model, FSDP) else model
         config = peft_model.peft_config["default"]
         packed = replace(config, r=2 * config.r, lora_alpha=2 * config.lora_alpha, inference_mode=True)
         tensors = {}
-        for name, layer in peft_model.named_modules():
-            if not isinstance(layer, PeftLinear):
-                continue
+        for name, layer in layers:
             name = name.replace("_fsdp_wrapped_module.", "")
-            ar, af = (layer.lora_A[k].weight.detach().cpu() for k in BRANCHES)
-            br, bf = (layer.lora_B[k].weight.detach().cpu() for k in BRANCHES)
+            ar, af = (read_factor(layer.lora_A[k]) for k in BRANCHES)
+            br, bf = (read_factor(layer.lora_B[k]) for k in BRANCHES)
             if state == "retain_only":
                 bf = torch.zeros_like(bf)
             tensors[f"{name}.lora_A.weight"] = torch.cat([ar, af], dim=0)

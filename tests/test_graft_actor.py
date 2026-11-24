@@ -149,6 +149,7 @@ def test_all_both_matches_vanilla_grpo_update_with_masked_tokens(process_group):
 
 
 def _distributed_worker(rank, world, path):
+    from unittest.mock import patch
     from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
     from verl.utils.fsdp_utils import get_fsdp_wrap_policy
     from verl.workers.actor.routed_actor import RoutedPPOActor
@@ -161,7 +162,9 @@ def _distributed_worker(rank, world, path):
         policy = get_fsdp_wrap_policy(model, is_lora=True)
         sharded = FSDP(model, device_id=torch.device("cpu"), use_orig_params=True, auto_wrap_policy=policy)
         actor = RoutedPPOActor(actor_cfg(2), sharded, torch.optim.AdamW(sharded.parameters(), lr=0.002))
-        initial = packed_adapter(sharded)[1]
+        with patch.object(FSDP, "summon_full_params", wraps=FSDP.summon_full_params) as summon:
+            initial = packed_adapter(sharded)[1]
+            assert summon.call_count and all(call.args[0] is not sharded for call in summon.call_args_list)
         tags = [[1, 1], [1, 0], [2, 2], [2, 0]][rank]
         metrics = actor.update_policy(policy_batch(tags))
         assert metrics["route/forget_only_fraction"] == [3 / 8]
