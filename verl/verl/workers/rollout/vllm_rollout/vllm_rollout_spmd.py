@@ -458,6 +458,12 @@ class vLLMRollout(BaseRollout):
         """
         peft_config, base_sync_done = kwargs.get("peft_config", None), kwargs.get("base_sync_done", False)
         if peft_config and base_sync_done:
+            if kwargs.get("replace_active_lora"):
+                # generate_sequences selects the registered adapter. Retire the
+                # previous full/stripped snapshot before registering its replacement.
+                engine = self.inference_engine.llm_engine
+                for adapter_id in list(engine.list_loras()):
+                    engine.remove_lora(adapter_id)
             lora_int_id = int(time.time_ns() % 0x7FFFFFFF)
             lora_reqest = TensorLoRARequest(
                 lora_name=f"{lora_int_id}",

@@ -315,7 +315,12 @@ class TaskRunner:
         train_sampler = create_rl_sampler(config.data, train_dataset)
 
         # Initialize the PPO trainer.
-        trainer = RayPPOTrainer(
+        trainer_class = RayPPOTrainer
+        if config.actor_rollout_ref.get("graft"):
+            from verl.trainer.ppo.graft_trainer import GraftValidationTrainer
+
+            trainer_class = GraftValidationTrainer
+        trainer = trainer_class(
             config=config,
             tokenizer=tokenizer,
             processor=processor,

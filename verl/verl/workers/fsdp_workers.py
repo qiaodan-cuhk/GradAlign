@@ -179,6 +179,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
         self._lora_rank = self.config.model.get("lora_rank", 0)
         self._is_lora = self._lora_rank > 0
+        self.graft = self.config.get("graft", None)
+        self.graft_state = "full"
 
         self.role = role
         assert self.role in ["actor", "rollout", "ref", "actor_rollout", "actor_rollout_ref"]
@@ -416,7 +418,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     "exclude_modules": convert_to_regular_types(self.config.model.exclude_modules),
                     "bias": "none",
                 }
-                actor_module = get_peft_model(actor_module, LoraConfig(**lora_config))
+                if self.graft and role == "actor":
+                    from verl.workers.actor.graft_lora import attach_adapters
+
+                    actor_module = attach_adapters(actor_module, LoraConfig(**lora_config),
+                                                   self.graft.mode == "routed", self.graft.seed)
+                else:
+                    actor_module = get_peft_model(actor_module, LoraConfig(**lora_config))
 
         self.use_orig_params = fsdp_config.get("use_orig_params", False)
         if self.config.actor.get("freeze_vision_tower", False):
@@ -644,7 +652,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         peft_config = None
         peft_model = getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
-        if hasattr(peft_model, "peft_config"):  # LoRA
+        if self.graft:
+            from verl.workers.actor.graft_lora import packed_adapter
+
+            if not self.base_sync_done or self.rollout.sleep_level != 1:
+                raise ValueError("Paired LoRA requires a preloaded vLLM base and level-1 sleep")
+            peft_config, params = packed_adapter(self.actor_module_fsdp, self.graft_state)
+        elif hasattr(peft_model, "peft_config"):  # LoRA
             peft_config = peft_model.peft_config.get("default", None)
             params = collect_lora_params(
                 module=self.actor_module_fsdp,
@@ -703,7 +717,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             await self.rollout.update_weights(per_tensor_base_params, base_sync_done=False)
             del base_model_params, per_tensor_base_params
 
-        await self.rollout.update_weights(per_tensor_param, peft_config=peft_config, base_sync_done=self.base_sync_done)
+        await self.rollout.update_weights(per_tensor_param, peft_config=peft_config, base_sync_done=self.base_sync_done,
+                                          **({"replace_active_lora": True} if self.graft else {}))
         log_gpu_memory_usage("After update_weights", logger=logger)
         del params, per_tensor_param
         aggressive_empty_cache(force_sync=True)
@@ -789,9 +804,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         if self._is_actor:
             actor_cfg = omega_conf_to_dataclass(self.config.actor)
-            self.actor = DataParallelPPOActor(
-                config=actor_cfg, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer
-            )
+            actor_type, actor_options = DataParallelPPOActor, {}
+            if self.graft and self.graft.mode == "routed":
+                from verl.workers.actor.routed_actor import RoutedPPOActor
+
+                actor_type = RoutedPPOActor
+                actor_options["forget_grad_scale"] = self.graft.forget_grad_scale
+            self.actor = actor_type(config=actor_cfg, actor_module=self.actor_module_fsdp,
+                                    actor_optimizer=self.actor_optimizer, **actor_options)
 
         if self._is_rollout:
             self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))
@@ -887,6 +907,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
 
         return output
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def set_graft_rollout_state(self, state):
+        if not self.graft or state not in ("full", "retain_only"):
+            raise ValueError(f"Invalid paired adapter rollout state {state}")
+        self.graft_state = state
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
     @DistProfiler.annotate(color="red", role="rollout_generate")
@@ -1030,7 +1056,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         )
         dist.barrier()
 
-        if self._is_lora and hasattr(getattr(self, "actor_module", self.actor_module_fsdp), "peft_config"):
+        if self.graft:
+            from verl.workers.actor.graft_lora import save_packed_adapter
+
+            save_packed_adapter(self.actor_module_fsdp, local_path)
+            dist.barrier()
+        elif self._is_lora and hasattr(getattr(self, "actor_module", self.actor_module_fsdp), "peft_config"):
             lora_save_path = os.path.join(local_path, "lora_adapter")
             peft_model = getattr(self, "actor_module", self.actor_module_fsdp)
             peft_config = {}
